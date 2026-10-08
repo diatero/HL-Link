@@ -79,6 +79,11 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         scan_secs: u64,
     },
+    /// 本机作为设备节点：让 HL Link（鸿蒙）等配对、发送和接收（需要 dfabricd 在运行）
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
     /// 自检：协议核心 + 本机环境 + 已配对设备（不修改任何数据）
     Selftest {
         /// 以 JSON 输出（便于附到问题报告）
@@ -106,6 +111,215 @@ enum Cmd {
         #[arg(long)]
         path: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// 节点状态（监听地址、待审批、已配对数量）
+    Status,
+    /// 开启节点（局域网监听 9527/9528，需防火墙放行）
+    On,
+    /// 关闭节点
+    Off,
+    /// 打开 5 分钟配对窗口：显示二维码，用 HL Link 扫码，然后在这里批准
+    Pair {
+        /// 同时把配对 JSON 写到文件（含一次性口令，用完删除）
+        #[arg(long)]
+        out: Option<String>,
+        /// 深色终端扫不出时反色显示
+        #[arg(long)]
+        invert: bool,
+        /// 只显示二维码，不在终端等待批准（之后用 dfctl node approve）
+        #[arg(long)]
+        no_wait: bool,
+        /// 把二维码另存为 SVG 图片（终端太窄显示不下时用图片扫码）
+        #[arg(long)]
+        svg: Option<String>,
+    },
+    /// 允许当前待审批的请求
+    Approve {
+        /// 配对时一并允许以后自动接收该设备的文件
+        #[arg(long)]
+        auto: bool,
+    },
+    /// 拒绝当前待审批的请求
+    Deny,
+    /// 已配对（连接本机）的设备
+    Peers,
+    /// 解除对某设备的信任（ID 前缀或名称）
+    Revoke { peer: String },
+    /// 设置是否自动接收某设备的文件：on / off
+    Auto { peer: String, value: String },
+    /// 发送文件给连接本机的设备（对方打开 HL Link 后拉取）
+    Send {
+        #[arg(long)]
+        to: String,
+        files: Vec<String>,
+    },
+    /// 收发记录
+    Transfers,
+    /// 清理已结束的记录（不删除已接收的文件）
+    Clean,
+    /// 取消一个收发
+    Cancel { transfer_id: String },
+}
+
+async fn node_ipc(cmd: IpcCommand) -> Result<serde_json::Value> {
+    let reply = try_ipc(cmd)
+        .await
+        .ok_or_else(|| DfError::Protocol("dfabricd 未运行：本机节点由后台进程提供，请先启动 dfabricd".into()))?;
+    if reply.ok {
+        Ok(reply.data.unwrap_or(serde_json::Value::Null))
+    } else {
+        Err(DfError::Protocol(reply.error.unwrap_or_else(|| "未知错误".into())))
+    }
+}
+
+fn print_qr(payload: &str, invert: bool) -> Result<()> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| DfError::Protocol(format!("二维码生成失败：{e}")))?;
+    let mut r = code.render::<Dense1x2>();
+    r.quiet_zone(true);
+    if invert {
+        r.dark_color(Dense1x2::Light).light_color(Dense1x2::Dark);
+    }
+    println!("{}", r.build());
+    Ok(())
+}
+
+async fn node_cmd(cmd: NodeCmd) -> Result<()> {
+    use serde_json::Value;
+    let show = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    match cmd {
+        NodeCmd::Status => {
+            let v = node_ipc(IpcCommand::NodeStatus).await?;
+            println!("节点：{}", if v["enabled"] == true { "已开启" } else { "已关闭" });
+            println!("nodeId：{}", v["nodeId"].as_str().unwrap_or(""));
+            println!("监听地址：{}", v["addresses"]);
+            println!("收件目录：{}", v["inbox"].as_str().unwrap_or(""));
+            println!("已配对设备：{}，配对窗口：{}", v["peers"], if v["pairing"] == true { "开启" } else { "关闭" });
+            if !v["approval"].is_null() {
+                println!("待审批：{}（dfctl node approve / deny）", v["approval"]["description"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        NodeCmd::On | NodeCmd::Off => {
+            let on = matches!(cmd, NodeCmd::On);
+            let v = node_ipc(IpcCommand::NodeEnable { on }).await?;
+            println!("节点已{}", if v["enabled"] == true { "开启（需要防火墙放行 TCP 9527、9528）" } else { "关闭" });
+            Ok(())
+        }
+        NodeCmd::Pair { out, invert, no_wait, svg } => {
+            let payload = node_ipc(IpcCommand::NodePair).await?;
+            let text = payload.to_string();
+            print_qr(&text, invert)?;
+            if let Some(path) = svg {
+                let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| DfError::Protocol(format!("二维码生成失败：{e}")))?;
+                let image = code.render::<qrcode::render::svg::Color>().min_dimensions(480, 480).quiet_zone(true).build();
+                df_core::fsutil::atomic_write(std::path::Path::new(&path), image.as_bytes())?;
+                println!("二维码图片已写入 {path}");
+            }
+            println!("用 HL Link「配对」页扫描上面的二维码（5 分钟内有效，地址 {}）。", payload["addresses"]);
+            if let Some(path) = out {
+                df_core::fsutil::atomic_write(std::path::Path::new(&path), text.as_bytes())?;
+                println!("配对 JSON 已写入 {path}（含一次性口令，导入后请删除）");
+            }
+            if no_wait {
+                println!("对方提交后运行 dfctl node approve [--auto] 批准。");
+                return Ok(());
+            }
+            let before = node_ipc(IpcCommand::NodePeers).await?.as_array().map_or(0, Vec::len);
+            let deadline = std::time::Instant::now() + Duration::from_secs(300);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let status = node_ipc(IpcCommand::NodeStatus).await?;
+                let approval = &status["approval"];
+                if approval["kind"] == "pair" {
+                    println!("\n设备请求配对：{}", approval["description"].as_str().unwrap_or("").replace('\n', "，"));
+                    print!("允许？[y=允许 / a=允许并自动接收文件 / 其他=拒绝]：");
+                    std::io::stdout().flush().ok();
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let answer = line.trim().to_ascii_lowercase();
+                    let accept = answer == "y" || answer == "a";
+                    node_ipc(IpcCommand::NodeDecide { accept, auto: answer == "a" }).await?;
+                    if !accept {
+                        println!("已拒绝");
+                        return Ok(());
+                    }
+                }
+                let peers = node_ipc(IpcCommand::NodePeers).await?;
+                if peers.as_array().map_or(0, Vec::len) > before {
+                    println!("配对成功。");
+                    return Ok(());
+                }
+                if status["pairing"] != true {
+                    break;
+                }
+            }
+            Err(DfError::Timeout("配对窗口已关闭".into()))
+        }
+        NodeCmd::Approve { auto } => {
+            let v = node_ipc(IpcCommand::NodeDecide { accept: true, auto }).await?;
+            println!("已允许：{}", v["decided"]["description"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        NodeCmd::Deny => {
+            let v = node_ipc(IpcCommand::NodeDecide { accept: false, auto: false }).await?;
+            println!("已拒绝：{}", v["decided"]["description"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        NodeCmd::Peers => {
+            let v = node_ipc(IpcCommand::NodePeers).await?;
+            let now = df_core::stores::now_ms();
+            for p in v.as_array().into_iter().flatten() {
+                let seen = p["lastSeen"].as_u64().unwrap_or(0);
+                let online = if seen > 0 && now.saturating_sub(seen) < 10_000 { "在线" } else { "离线" };
+                println!(
+                    "{}  {}  {}  {}",
+                    &p["id"].as_str().unwrap_or("")[..12],
+                    p["name"].as_str().unwrap_or(""),
+                    if p["auto"] == true { "自动接收" } else { "逐次确认" },
+                    online
+                );
+            }
+            Ok(())
+        }
+        NodeCmd::Revoke { peer } => {
+            let v = node_ipc(IpcCommand::NodeRevoke { peer }).await?;
+            println!("已解除信任：{}", v["revoked"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        NodeCmd::Auto { peer, value } => {
+            let on = matches!(value.as_str(), "on" | "true" | "1" | "yes");
+            node_ipc(IpcCommand::NodeAuto { peer, on }).await?;
+            println!("自动接收已{}", if on { "开启" } else { "关闭" });
+            Ok(())
+        }
+        NodeCmd::Send { to, files } => {
+            let paths = files
+                .iter()
+                .map(|f| std::fs::canonicalize(f).map(|p| p.to_string_lossy().to_string()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let v = node_ipc(IpcCommand::NodeSend { peer: to, paths }).await?;
+            println!("已排队 {} 个文件，对方打开 HL Link 后开始传输", v["queued"]);
+            Ok(())
+        }
+        NodeCmd::Transfers => {
+            show(&node_ipc(IpcCommand::NodeTransfers).await?);
+            Ok(())
+        }
+        NodeCmd::Clean => {
+            let v = node_ipc(IpcCommand::NodeClean).await?;
+            println!("已清理 {} 条记录", v["removed"]);
+            Ok(())
+        }
+        NodeCmd::Cancel { transfer_id } => {
+            node_ipc(IpcCommand::NodeCancel { transfer_id }).await?;
+            println!("已取消");
+            Ok(())
+        }
+    }
 }
 
 fn main() {
@@ -138,6 +352,7 @@ async fn run(cmd: Cmd) -> Result<()> {
     df_core::tls::ensure_provider();
     match cmd {
         Cmd::PairNear { scan_secs } => pair_near(Duration::from_secs(scan_secs)).await,
+        Cmd::Node { cmd } => node_cmd(cmd).await,
         Cmd::Link { to, p2p, scan_secs } => {
             let store = dfabric::open_store()?;
             dfabric::secrets::restore_secrets_into_trusts(&store);

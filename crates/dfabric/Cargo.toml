@@ -13,6 +13,8 @@ path = "src/bin/dfabricd.rs"
 
 [dependencies]
 df-core = { path = "../df-core" }
+df-node = { path = "../df-node" }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tokio.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true

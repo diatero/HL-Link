@@ -7,6 +7,7 @@ pub mod agent;
 pub mod ble;
 pub mod logging;
 pub mod mdns;
+pub mod node_host;
 pub mod secrets;
 pub mod selfcheck;
 pub mod wifi;

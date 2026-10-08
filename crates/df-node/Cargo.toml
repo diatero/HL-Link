@@ -1,0 +1,24 @@
+[package]
+name = "df-node"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+df-core = { path = "../df-core" }
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+uuid.workspace = true
+hex.workspace = true
+rand.workspace = true
+x509-parser.workspace = true
+p256.workspace = true
+mdns-sd.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+if-addrs = "0.13"
+time = "0.3"

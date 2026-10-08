@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/df-core", "crates/dfabric", "crates/ui"]
+members = ["crates/df-core", "crates/df-node", "crates/dfabric", "crates/ui"]
 
 [workspace.package]
 version = "0.1.0"

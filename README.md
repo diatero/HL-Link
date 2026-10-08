@@ -27,6 +27,15 @@ crates/df-core      协议核心（跨平台，无平台依赖）
   ├─ fsutil.rs         fsync（macOS 用 F_FULLFSYNC）、目录 fsync、原子写入/移动、空间预检
   └─ stores.rs         信任设备 / 本机名称 / clientId / 待定私钥（0600）
 
+crates/df-node      本机作为 DF/1 节点（Node 角色，让 HL Link 鸿蒙端等控制端配对与互传）
+  ├─ identity.rs       私有 P-256 CA（10 年）、服务端证书（IP SAN = 监听地址）、签发客户端证书（rcgen）
+  ├─ node.rs           TLS 1.3 监听 9527/9528、HELLO/PAIR/STATUS/FILE_OFFER/TEXT_OFFER/DATA_BIND、
+  │                    FILE_SEND（PULL_*）、配对窗口、本机审批、撤销、mDNS 发布
+  ├─ incoming.rs       接收记录：逐块 fsync + 位图 → 整文件校验 → 收件目录（不覆盖）
+  ├─ outgoing.rs       待对端拉取的发送记录（暂存 + SHA-256，跨重启保留）
+  ├─ peers.rs          已信任的控制端（peerId = 客户端证书 SHA-256，0600）
+  └─ net.rs            只用物理网卡的私网 IPv4（排除 tun/wg/docker/代理 fake-ip 等）
+
 crates/dfabric      平台适配层 + 可执行
   ├─ logging.rs        平台日志目录 + 初始化（macOS ~/Library/Logs/DeviceFabric）
   ├─ selfcheck.rs      自检：本机环境、keyring、已配对设备、可选链路连通性
@@ -97,6 +106,30 @@ CLI 与 GUI 都在 `dfabricd` 运行时通过本地 IPC 交接任务，否则直
 
 所有命令都支持 `--log-level error|warn|info|debug`、`--no-log`（只输出终端）、
 `--log-stderr`（同时镜像到终端）；级别也可用 `DFABRIC_LOG` 环境变量设置。
+
+### 本机作为节点（鸿蒙 ↔ Linux 互传）
+
+DF/1 每一对设备里一端是节点、一端是控制端。Linux 端除了作为 LineageOS 手机节点的控制端，
+也可以自己当节点，让 HL Link（鸿蒙）配对、发文件给电脑，并从电脑拉取文件。节点由 `dfabricd` 提供，默认关闭。
+
+```bash
+sudo ufw allow proto tcp from 192.168.1.0/24 to any port 9527,9528   # 放行局域网入站（按实际网段）
+dfctl node on                      # 开启（只监听物理网卡的私网 IPv4）
+dfctl node pair --svg qr.svg       # 5 分钟配对窗口：终端二维码 + 图片，HL Link「配对」页扫码，回到终端批准
+dfctl node peers                   # 已配对设备（在线 = 最近 10 秒内拉取过）
+dfctl node auto <设备> on          # 该设备发来的文件自动接收（否则 dfctl node approve / deny，90 秒内）
+dfctl node send --to <设备> a.pdf  # 发给鸿蒙：对方 HL Link 在前台时约 3 秒内开始拉取
+dfctl node transfers / clean / cancel <id> / revoke <设备> / off
+```
+
+收到的文件在 `~/下载/HL Link/`（同名不覆盖）。回给对端的完成回执是不透明的
+`content://hllink.desktop/received/<transferId>`，不包含本机路径。
+HELLO_ACK 额外带 `links: ["LAN"]`：桌面节点没有 BLE 外设和 Wi-Fi Direct，控制端可据此跳过这两种回退。
+
+已验证：LineageOS 仓库的 `df_client.py` 配对/上传/续传/重放，`test_node.py` 13 项负向用例全部通过；
+本机控制端 ↔ 本机节点的推送（批准/拒绝）、拉取、撤销、开关；鸿蒙 Pura X Max 真机扫码配对、
+鸿蒙 → Linux 三个文件、Linux → 鸿蒙一个文件（两端整文件校验通过）。
+未验证：macOS / Windows 上的节点、无摄像头设备之间的配对、电脑换网后的鸿蒙重连。
 
 ## 安全实现要点（对照开发说明第 14 节）
 

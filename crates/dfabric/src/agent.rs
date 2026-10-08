@@ -119,6 +119,31 @@ pub enum IpcCommand {
     Remove { node_id: String },
     #[serde(rename = "shutdown")]
     Shutdown,
+    // —— 本机作为节点（df-node）——
+    #[serde(rename = "node-status")]
+    NodeStatus,
+    #[serde(rename = "node-enable")]
+    NodeEnable { on: bool },
+    #[serde(rename = "node-pair")]
+    NodePair,
+    #[serde(rename = "node-pair-close")]
+    NodePairClose,
+    #[serde(rename = "node-decide")]
+    NodeDecide { accept: bool, auto: bool },
+    #[serde(rename = "node-peers")]
+    NodePeers,
+    #[serde(rename = "node-revoke")]
+    NodeRevoke { peer: String },
+    #[serde(rename = "node-auto")]
+    NodeAuto { peer: String, on: bool },
+    #[serde(rename = "node-send")]
+    NodeSend { peer: String, paths: Vec<String> },
+    #[serde(rename = "node-transfers")]
+    NodeTransfers,
+    #[serde(rename = "node-clean")]
+    NodeClean,
+    #[serde(rename = "node-cancel")]
+    NodeCancel { transfer_id: String },
 }
 
 /// 向运行中的 Agent 发送一条 IPC 命令（未运行返回 None，调用方回退直连模式）。
@@ -169,6 +194,8 @@ pub struct Agent {
     pub store: df_core::stores::Store,
     pub mdns: crate::mdns::MdnsBrowser,
     pub queue_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// 本机作为节点（初始化失败时为 None，不影响控制端功能）。
+    pub node: Option<df_node::Node>,
 }
 
 impl Agent {
@@ -209,7 +236,20 @@ impl Agent {
         if pending > 0 {
             let _ = queue_tx.send(());
         }
-        let agent = std::sync::Arc::new(Agent { store, mdns, queue_tx });
+        let node = match crate::node_host::open() {
+            Ok(n) => {
+                crate::node_host::spawn_notifications(&n);
+                if crate::node_host::load_settings().enabled {
+                    n.start();
+                }
+                Some(n)
+            }
+            Err(e) => {
+                df_core::logging::warn("agent", format!("{e}"));
+                None
+            }
+        };
+        let agent = std::sync::Arc::new(Agent { store, mdns, queue_tx, node });
         let a2 = agent.clone();
         tokio::spawn(async move { send_worker(a2, queue_rx).await });
         let a3 = agent.clone();
@@ -287,7 +327,7 @@ async fn send_worker(agent: std::sync::Arc<Agent>, mut rx: tokio::sync::mpsc::Un
                 Err(e) => {
                     rec.state = "failed".into();
                     rec.error = Some(e.to_string());
-                    let label = rec.meta.name.clone();
+                    let label = if rec.meta.name.is_empty() { "文本".to_string() } else { rec.meta.name.clone() };
                     update_send(rec).ok();
                     df_core::logging::warn("send", format!("发送失败（{label}）：{e}"));
                     notify("发送失败", &e.to_string());
@@ -592,6 +632,91 @@ async fn execute_ipc(agent: &Agent, cmd: IpcCommand) -> IpcReply {
             }
         }
         IpcCommand::Shutdown => IpcReply::ok(serde_json::json!({})),
+        cmd => match &agent.node {
+            Some(node) => match execute_node(node, cmd).await {
+                Ok(v) => IpcReply::ok(v),
+                Err(e) => IpcReply::err(e),
+            },
+            None => IpcReply::err("本机节点未能初始化，见日志".into()),
+        },
+    }
+}
+
+async fn execute_node(node: &df_node::Node, cmd: IpcCommand) -> std::result::Result<serde_json::Value, String> {
+    use serde_json::json;
+    let peer_of = |q: &str| node.find_peer(q).ok_or_else(|| format!("没有唯一匹配的已配对设备：{q}"));
+    match cmd {
+        IpcCommand::NodeStatus => Ok(node.status()),
+        IpcCommand::NodeEnable { on } => {
+            if on {
+                node.start();
+            } else {
+                node.stop();
+            }
+            crate::node_host::save_settings(&crate::node_host::NodeSettings { enabled: on }).map_err(|e| e.to_string())?;
+            Ok(node.status())
+        }
+        IpcCommand::NodePair => {
+            // 刚开启时地址刷新是异步的，最多等 3 秒拿到监听地址
+            for _ in 0..30 {
+                if !node.enabled() || !node.addresses().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if node.addresses().is_empty() {
+                return Err("没有可用的局域网地址（请连接 Wi-Fi 或有线网络）".into());
+            }
+            node.open_pairing().map_err(|e| format!("{e}（请先 dfctl node on）"))
+        }
+        IpcCommand::NodePairClose => {
+            node.close_pairing();
+            Ok(json!({}))
+        }
+        IpcCommand::NodeDecide { accept, auto } => {
+            let pending = node.pending_approval().ok_or("当前没有待审批的请求")?;
+            node.decide(&pending.id, accept, auto);
+            Ok(json!({ "decided": pending }))
+        }
+        IpcCommand::NodePeers => Ok(json!(node.peers())),
+        IpcCommand::NodeRevoke { peer } => {
+            let id = peer_of(&peer)?;
+            node.revoke(&id).map_err(|e| e.to_string())?;
+            Ok(json!({ "revoked": id }))
+        }
+        IpcCommand::NodeAuto { peer, on } => {
+            let id = peer_of(&peer)?;
+            node.set_auto(&id, on).map_err(|e| e.to_string())?;
+            Ok(json!({ "peer": id, "auto": on }))
+        }
+        IpcCommand::NodeSend { peer, paths } => {
+            let id = peer_of(&peer)?;
+            for p in &paths {
+                if !std::path::Path::new(p).is_file() {
+                    return Err(format!("不是可读文件：{p}"));
+                }
+            }
+            // 暂存（复制 + 哈希）在后台进行，入口进程立即返回
+            for p in paths.clone() {
+                let node = node.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node.send_file(&id, std::path::Path::new(&p)).await {
+                        df_core::logging::warn("node", format!("排队发送失败（{p}）：{e}"));
+                        notify("发送失败", &format!("{p}：{e}"));
+                    }
+                });
+            }
+            Ok(json!({ "queued": paths.len(), "peer": id }))
+        }
+        IpcCommand::NodeTransfers => Ok(node.transfers()),
+        IpcCommand::NodeClean => Ok(json!({ "removed": node.forget_finished() })),
+        IpcCommand::NodeCancel { transfer_id } => node
+            .cancel_send(&transfer_id)
+            .or_else(|_| node.cancel_incoming(&transfer_id))
+            .map(|_| json!({}))
+            .map_err(|e| e.to_string()),
+        _ => Err("不支持的节点命令".into()),
     }
 }
 
