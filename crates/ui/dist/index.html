@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeviceFabric</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo"></div>
+      <h1>DeviceFabric</h1>
+      <span id="daemon-badge" class="badge off">Agent 未运行</span>
+    </div>
+    <nav>
+      <button class="tab active" data-tab="devices">设备</button>
+      <button class="tab" data-tab="pulls">接收 <span id="pull-count" class="count hidden">0</span></button>
+      <button class="tab" data-tab="sends">发送</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- 设备 -->
+    <section id="tab-devices" class="panel active">
+      <div class="row">
+        <button id="btn-pair-near" class="primary">附近配对</button>
+        <button id="btn-pair-import">导入配对文件…</button>
+      </div>
+      <div id="device-list" class="cards"></div>
+      <div id="pair-modal" class="modal hidden">
+        <div class="modal-card">
+          <h2>附近配对</h2>
+          <p id="pair-status">正在扫描附近设备…</p>
+          <div id="pair-code-box" class="hidden">
+            <div id="pair-sas" class="sas">······</div>
+            <p>请确认手机上显示<b>相同的 6 位验证码</b>，然后确认：</p>
+            <div class="row center">
+              <button id="btn-pair-confirm" class="primary">验证码一致，确认配对</button>
+              <button id="btn-pair-cancel">取消</button>
+            </div>
+          </div>
+          <p id="pair-error" class="error hidden"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 接收 -->
+    <section id="tab-pulls" class="panel">
+      <div id="pull-list" class="cards"></div>
+    </section>
+
+    <!-- 发送 -->
+    <section id="tab-sends" class="panel">
+      <div class="row">
+        <button id="btn-send-files" class="primary">选择文件发送…</button>
+        <input id="text-input" type="text" placeholder="或输入要发送的文本…" />
+        <button id="btn-send-text">发送文本</button>
+      </div>
+      <div id="send-list" class="cards"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="tab-settings" class="panel">
+      <h3>本机显示名称</h3>
+      <div class="row">
+        <input id="name-input" type="text" placeholder="跟随系统名称" />
+        <button id="btn-save-name" class="primary">保存</button>
+        <button id="btn-reset-name">恢复跟随系统</button>
+      </div>
+      <p class="hint">名称会在每次已鉴权连接时同步到手机；清空即恢复跟随系统名称。</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

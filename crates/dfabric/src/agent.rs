@@ -1,0 +1,567 @@
+//! 后台 Agent：登录用户的常驻进程，持有全部状态（第 3 / 10.2 / 12 节）。
+//!
+//! - 在线时对每个可达节点保持独立接收轮询（约每 3 秒 PULL_LIST）；
+//! - 新 offer 只通知用户，“用户接受前不拉取任何字节”；
+//! - 串行发送队列：分享入口/CLI 通过 IPC 交接“发送请求 + 文件路径”后立即返回，
+//!   入口进程退出不影响任务；
+//! - IPC 只对当前用户开放（Unix socket 0700 目录 / 命名管道当前用户 ACL）。
+
+use crate::{connect_trust, data_dir, display_name, find_trust, notify, open_store};
+use df_core::error::{DfError, Result};
+use df_core::stores::Trust;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::time::Duration;
+
+// —— 待接收清单（pulls.json）——
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRecord {
+    pub node_id: String,
+    pub node_name: Option<String>,
+    pub transfer_id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub chunk_size: u64,
+    pub sha256: String,
+    pub state: String, // pending | accepted | denied | completed | cancelled
+    #[serde(default)]
+    pub done_b64: String,
+}
+
+fn pulls_path() -> PathBuf {
+    data_dir().join("pulls.json")
+}
+
+pub fn load_pulls() -> Vec<PullRecord> {
+    std::fs::read_to_string(pulls_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_pulls(list: &[PullRecord]) -> Result<()> {
+    df_core::fsutil::atomic_write(&pulls_path(), &serde_json::to_vec_pretty(list)?)
+}
+
+pub fn update_pull(rec: PullRecord) -> Result<()> {
+    let mut list = load_pulls();
+    if let Some(slot) = list.iter_mut().find(|p| p.transfer_id == rec.transfer_id) {
+        *slot = rec;
+    } else {
+        list.push(rec);
+    }
+    save_pulls(&list)
+}
+
+// —— 发送记录（send_records.json，跨重启续传）——
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendRecord {
+    pub node_id: String,
+    pub meta: df_core::msg::FileMeta,
+    pub state: String, // queued | sending | completed | failed | cancelled
+    #[serde(default)]
+    pub done_b64: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+fn sends_path() -> PathBuf {
+    data_dir().join("send_records.json")
+}
+
+pub fn load_sends() -> Vec<SendRecord> {
+    std::fs::read_to_string(sends_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_sends(list: &[SendRecord]) -> Result<()> {
+    df_core::fsutil::atomic_write(&sends_path(), &serde_json::to_vec_pretty(list)?)
+}
+
+pub fn update_send(rec: SendRecord) -> Result<()> {
+    let mut list = load_sends();
+    if let Some(slot) = list.iter_mut().find(|p| p.meta.transfer_id == rec.meta.transfer_id) {
+        *slot = rec;
+    } else {
+        list.push(rec);
+    }
+    save_sends(&list)
+}
+
+// —— IPC 命令 ——
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd")]
+pub enum IpcCommand {
+    #[serde(rename = "send-files")]
+    SendFiles { to: Option<String>, paths: Vec<String> },
+    #[serde(rename = "send-text")]
+    SendText { to: Option<String>, text: String },
+    #[serde(rename = "status")]
+    Status,
+    #[serde(rename = "pulls")]
+    Pulls,
+    #[serde(rename = "accept")]
+    Accept { transfer_id: String },
+    #[serde(rename = "deny")]
+    Deny { transfer_id: String },
+    #[serde(rename = "devices")]
+    Devices,
+    #[serde(rename = "set-name")]
+    SetName { name: Option<String> },
+    #[serde(rename = "remove")]
+    Remove { node_id: String },
+    #[serde(rename = "shutdown")]
+    Shutdown,
+}
+
+/// 向运行中的 Agent 发送一条 IPC 命令（未运行返回 None，调用方回退直连模式）。
+pub async fn ipc_request(cmd: IpcCommand) -> Option<IpcReply> {
+    #[cfg(unix)]
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(ipc_socket_path()).await.ok()?;
+        let mut line = serde_json::to_string(&cmd).ok()?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.ok()?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.ok()?;
+        serde_json::from_slice(&buf).ok()
+    }
+    #[cfg(windows)]
+    {
+        let _ = cmd;
+        None // Windows 命名管道 IPC 在后续版本接入
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IpcReply {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl IpcReply {
+    fn ok(v: serde_json::Value) -> IpcReply {
+        IpcReply { ok: true, data: Some(v), error: None }
+    }
+    fn err(e: String) -> IpcReply {
+        IpcReply { ok: false, data: None, error: Some(e) }
+    }
+}
+
+pub fn ipc_socket_path() -> PathBuf {
+    data_dir().join("agent.sock")
+}
+
+// —— Agent 运行时 ——
+
+pub struct Agent {
+    pub store: df_core::stores::Store,
+    pub mdns: crate::mdns::MdnsBrowser,
+    pub queue_tx: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Agent {
+    pub async fn start() -> Result<std::sync::Arc<Agent>> {
+        let store = open_store()?;
+        crate::secrets::restore_secrets_into_trusts(&store);
+        let mdns = crate::mdns::MdnsBrowser::new();
+        let _ = mdns.start(); // mDNS 不可用时退回 BLE/上次地址，不致命
+
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = std::sync::Arc::new(Agent { store, mdns, queue_tx });
+        let a2 = agent.clone();
+        tokio::spawn(async move { send_worker(a2, queue_rx).await });
+        let a3 = agent.clone();
+        tokio::spawn(async move { receive_poller(a3).await });
+        Ok(agent)
+    }
+
+    /// 交接发送任务（分享入口/CLI 调用后立即返回）。
+    pub fn enqueue_files(&self, to: Option<String>, paths: Vec<String>) -> Result<usize> {
+        let mut staged = 0;
+        for p in &paths {
+            let (meta, staged_path) = crate::stage_file(&self.store, std::path::Path::new(p))?;
+            let trust = crate::pick_trust(&self.store, to.as_deref())?;
+            update_send(SendRecord {
+                node_id: trust.node_id,
+                meta,
+                state: "queued".into(),
+                done_b64: String::new(),
+                error: None,
+            })
+            .ok();
+            let _ = staged_path; // 暂存路径由 transferId 决定，worker 重新拼接
+            staged += 1;
+        }
+        let _ = self.queue_tx.send(());
+        Ok(staged)
+    }
+
+    pub fn enqueue_text(&self, to: Option<String>, text: String) -> Result<()> {
+        let trust = crate::pick_trust(&self.store, to.as_deref())?;
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        if text.len() > df_core::consts::MAX_TEXT {
+            // 超长文本作为 .txt 文件发送
+            let tmp = self.store.staging_dir().join(format!("text-{transfer_id}.txt"));
+            df_core::fsutil::atomic_write(&tmp, text.as_bytes())?;
+            let (meta, _) = crate::stage_file(&self.store, &tmp)?;
+            let _ = std::fs::remove_file(&tmp);
+            update_send(SendRecord { node_id: trust.node_id, meta, state: "queued".into(), done_b64: String::new(), error: None }).ok();
+        } else {
+            update_send(SendRecord {
+                node_id: trust.node_id,
+                meta: df_core::msg::FileMeta {
+                    transfer_id,
+                    name: String::new(),
+                    mime: "text/plain".into(),
+                    size: text.len() as u64,
+                    chunk_size: df_core::consts::CHUNK_SIZE,
+                    sha256: String::new(),
+                },
+                state: "queued-text".into(),
+                done_b64: text,
+                error: None,
+            })
+            .ok();
+        }
+        let _ = self.queue_tx.send(());
+        Ok(())
+    }
+}
+
+/// 串行发送 worker：一次只处理一个任务。
+async fn send_worker(agent: std::sync::Arc<Agent>, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
+    loop {
+        if rx.recv().await.is_none() {
+            return;
+        }
+        // 逐条处理 queued
+        loop {
+            let next = load_sends()
+                .into_iter()
+                .find(|r| r.state == "queued" || r.state == "queued-text");
+            let Some(mut rec) = next else { break };
+            match run_send_task(&agent, &mut rec).await {
+                Ok(()) => {}
+                Err(e) => {
+                    rec.state = "failed".into();
+                    rec.error = Some(e.to_string());
+                    update_send(rec).ok();
+                    notify("发送失败", &e.to_string());
+                }
+            }
+        }
+    }
+}
+
+async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
+    let Some(trust) = find_trust(&agent.store, &rec.node_id) else {
+        return Err(DfError::Protocol("节点已删除".into()));
+    };
+    let name = display_name(&agent.store);
+    let mut ctrl = connect_trust(&trust, Some(&name), &agent.mdns).await?;
+    let config = df_core::tls::client_config(&trust.ca_pem, &trust.cert_pem, &trust.key_pem)?;
+    let ack_session = ctrl.hello_session_id.clone();
+
+    if rec.state == "queued-text" {
+        let text = rec.done_b64.clone();
+        df_core::transfer::up::send_text(&mut ctrl, &rec.meta.transfer_id, &text).await?;
+        rec.state = "completed".into();
+        update_send(rec.clone()).ok();
+        return Ok(());
+    }
+
+    let staged = agent.store.staging_dir().join(&rec.meta.transfer_id);
+    let mut done = df_core::bitmap::decode_bits(&rec.done_b64, rec.meta.chunk_count()).unwrap_or_default();
+    let mut rec2 = rec.clone();
+    rec2.state = "sending".into();
+    update_send(rec2).ok();
+
+    let meta = rec.meta.clone();
+    let mut persist = |set: &BTreeSet<u64>| {
+        rec.done_b64 = df_core::bitmap::encode_bits(set);
+        update_send(rec.clone()).ok();
+    };
+    let outcome = df_core::transfer::up::upload(
+        &mut ctrl,
+        config,
+        &ack_session,
+        &meta,
+        &staged,
+        &mut done,
+        None,
+        Some(&mut persist),
+    )
+    .await?;
+    if matches!(outcome, df_core::transfer::up::Outcome::Completed { .. }) {
+        rec.state = "completed".into();
+        update_send(rec.clone()).ok();
+        let _ = std::fs::remove_file(&staged);
+        notify("发送完成", &rec.meta.name);
+    } else {
+        rec.state = "completed".into();
+        update_send(rec.clone()).ok();
+    }
+    Ok(())
+}
+
+/// 接收轮询：每 3 秒 PULL_LIST（独立控制会话，不与发送共用）。
+async fn receive_poller(agent: std::sync::Arc<Agent>) {
+    loop {
+        let trusts = agent.store.trusts();
+        for trust in trusts.iter().filter(|t| !t.revoked) {
+            let _ = poll_one(&agent, trust).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+async fn poll_one(agent: &Agent, trust: &Trust) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let name = display_name(&agent.store);
+    let mut ctrl = connect_trust(trust, Some(&name), &agent.mdns).await?;
+    let list = df_core::transfer::down::pull_list(&mut ctrl).await?;
+    let _ = ctrl.stream.shutdown().await;
+
+    let mut pulls = load_pulls();
+    for offer in &list.offers {
+        if pulls.iter().any(|p| p.transfer_id == offer.meta.transfer_id) {
+            continue;
+        }
+        let rec = PullRecord {
+            node_id: trust.node_id.clone(),
+            node_name: trust.name.clone(),
+            transfer_id: offer.meta.transfer_id.clone(),
+            name: offer.meta.name.clone(),
+            mime: offer.meta.mime.clone(),
+            size: offer.meta.size,
+            chunk_size: offer.meta.chunk_size,
+            sha256: offer.meta.sha256.clone(),
+            state: "pending".into(),
+            done_b64: String::new(),
+        };
+        update_pull(rec).ok();
+        notify("收到文件请求", &format!("{} 想发送「{}」", trust.name.as_deref().unwrap_or("Lineage 设备"), offer.meta.name));
+    }
+    for ended in &list.ended {
+        if let Some(p) = pulls.iter_mut().find(|p| p.transfer_id == ended.transfer_id) {
+            if ended.state.contains("CANCEL") {
+                p.state = "cancelled".into();
+            }
+            update_pull(p.clone()).ok();
+        }
+    }
+    Ok(())
+}
+
+// —— IPC 服务器 ——
+
+pub async fn run_ipc_server(agent: std::sync::Arc<Agent>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    #[cfg(unix)]
+    {
+        let path = ipc_socket_path();
+        let _ = std::fs::remove_file(&path);
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("IPC 绑定失败: {e}");
+                return;
+            }
+        };
+        // 只对当前用户开放（目录 0700 + socket 0600）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        handle_ipc_conn(agent.clone(), stream).await;
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    #[cfg(windows)]
+    {
+        let _ = shutdown;
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_ipc_conn(agent: std::sync::Arc<Agent>, mut stream: tokio::net::UnixStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.iter().any(|&b| b == b'\n') {
+            break;
+        }
+        if buf.len() > 1024 * 1024 {
+            break;
+        }
+    }
+    let line = String::from_utf8_lossy(&buf);
+    let reply = match serde_json::from_str::<IpcCommand>(line.trim()) {
+        Ok(cmd) => execute_ipc(&agent, cmd).await,
+        Err(e) => IpcReply::err(format!("IPC 命令解析失败: {e}")),
+    };
+    let mut out = serde_json::to_vec(&reply).unwrap_or_default();
+    out.push(b'\n');
+    let _ = stream.write_all(&out).await;
+}
+
+async fn execute_ipc(agent: &Agent, cmd: IpcCommand) -> IpcReply {
+    match cmd {
+        IpcCommand::SendFiles { to, paths } => match agent.enqueue_files(to, paths) {
+            Ok(n) => IpcReply::ok(serde_json::json!({ "queued": n })),
+            Err(e) => IpcReply::err(e.to_string()),
+        },
+        IpcCommand::SendText { to, text } => match agent.enqueue_text(to, text) {
+            Ok(()) => IpcReply::ok(serde_json::json!({ "queued": 1 })),
+            Err(e) => IpcReply::err(e.to_string()),
+        },
+        IpcCommand::Status => {
+            let sends = load_sends();
+            IpcReply::ok(serde_json::json!(sends))
+        }
+        IpcCommand::Pulls => IpcReply::ok(serde_json::json!(load_pulls())),
+        IpcCommand::Accept { transfer_id } => match accept_pull(&agent.store, &agent.mdns, &transfer_id).await {
+            Ok(path) => IpcReply::ok(serde_json::json!({ "path": path })),
+            Err(e) => IpcReply::err(e.to_string()),
+        },
+        IpcCommand::Deny { transfer_id } => {
+            let pulls = load_pulls();
+            let Some(rec) = pulls.iter().find(|p| p.transfer_id == transfer_id) else {
+                return IpcReply::err("没有该待接收项".into());
+            };
+            let Some(trust) = find_trust(&agent.store, &rec.node_id) else {
+                return IpcReply::err("节点不存在".into());
+            };
+            let mut rec2 = rec.clone();
+            rec2.state = "denied".into();
+            update_pull(rec2).ok();
+            let result = async {
+                let name = display_name(&agent.store);
+                let mut ctrl = connect_trust(&trust, Some(&name), &agent.mdns).await?;
+                df_core::transfer::down::pull_cancel(&mut ctrl, &transfer_id).await
+            }
+            .await;
+            match result {
+                Ok(()) => IpcReply::ok(serde_json::json!({})),
+                Err(e) => IpcReply::err(e.to_string()),
+            }
+        }
+        IpcCommand::Devices => IpcReply::ok(serde_json::json!(agent.store.trusts())),
+        IpcCommand::SetName { name } => match agent.store.set_local_name(name.as_deref()) {
+            Ok(()) => IpcReply::ok(serde_json::json!({})),
+            Err(e) => IpcReply::err(e.to_string()),
+        },
+        IpcCommand::Remove { node_id } => {
+            let Some(t) = find_trust(&agent.store, &node_id) else {
+                return IpcReply::err("没有匹配的信任设备".into());
+            };
+            crate::secrets::drop_trust(&t.node_id);
+            match agent.store.remove_trust(&t.node_id) {
+                Ok(_) => IpcReply::ok(serde_json::json!({})),
+                Err(e) => IpcReply::err(e.to_string()),
+            }
+        }
+        IpcCommand::Shutdown => IpcReply::ok(serde_json::json!({})),
+    }
+}
+
+/// 接受并下载一个待接收项（用户接受前绝不拉取字节）。
+pub async fn accept_pull(
+    store: &df_core::stores::Store,
+    mdns: &crate::mdns::MdnsBrowser,
+    transfer_id: &str,
+) -> Result<String> {
+    let pulls = load_pulls();
+    let Some(rec) = pulls.iter().find(|p| p.transfer_id == transfer_id && p.state == "pending") else {
+        return Err(DfError::Protocol("没有该待接收项（或状态不是 pending）".into()));
+    };
+    let Some(trust) = find_trust(store, &rec.node_id) else {
+        return Err(DfError::Protocol("节点不存在".into()));
+    };
+    let meta = df_core::msg::FileMeta {
+        transfer_id: rec.transfer_id.clone(),
+        name: rec.name.clone(),
+        mime: rec.mime.clone(),
+        size: rec.size,
+        chunk_size: rec.chunk_size,
+        sha256: rec.sha256.clone(),
+    };
+    meta.validate()?;
+
+    let staging = store.staging_dir().join(&meta.transfer_id);
+    let commit_to = store.inbox_dir().join(df_core::names::unique_filename(&store.inbox_dir(), &meta.name));
+    let mut done = df_core::bitmap::decode_bits(&rec.done_b64, meta.chunk_count()).unwrap_or_default();
+
+    let config = df_core::tls::client_config(&trust.ca_pem, &trust.cert_pem, &trust.key_pem)?;
+    let name = display_name(store);
+    let mut ctrl = connect_trust(&trust, Some(&name), mdns).await?;
+    let ack_session = ctrl.hello_session_id.clone();
+
+    // 稀疏预分配 + 崩溃恢复由 journal（pulls.json 位图）支撑
+    std::fs::create_dir_all(store.staging_dir())?;
+    std::fs::File::create(&staging)?.set_len(meta.size)?;
+
+    let mut rec_mut = rec.clone();
+    rec_mut.state = "accepted".into();
+    update_pull(rec_mut.clone()).ok();
+
+    let mut journal = |set: &BTreeSet<u64>| {
+        rec_mut.done_b64 = df_core::bitmap::encode_bits(set);
+        update_pull(rec_mut.clone()).ok();
+    };
+    let mut progress = |done_bytes: u64, total: u64| {
+        if total > 0 && done_bytes % (16 * 1024 * 1024) < 1024 * 1024 {
+            println!("  接收进度: {done_bytes}/{total}");
+        }
+    };
+    df_core::transfer::down::pull_accept(
+        &mut ctrl,
+        config,
+        &ack_session,
+        &meta,
+        &staging,
+        &commit_to,
+        &mut done,
+        Some(&mut journal),
+        Some(&mut progress),
+    )
+    .await?;
+
+    let mut rec_final = rec_mut.clone();
+    rec_final.state = "completed".into();
+    update_pull(rec_final).ok();
+    let _ = std::fs::remove_file(&staging);
+    let path = commit_to.to_string_lossy().to_string();
+    notify("接收完成", &path);
+    Ok(path)
+}

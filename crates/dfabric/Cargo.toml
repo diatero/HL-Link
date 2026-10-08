@@ -1,0 +1,33 @@
+[package]
+name = "dfabric"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dfctl"
+path = "src/bin/dfctl.rs"
+
+[[bin]]
+name = "dfabricd"
+path = "src/bin/dfabricd.rs"
+
+[dependencies]
+df-core = { path = "../df-core" }
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+uuid.workspace = true
+hex.workspace = true
+dirs.workspace = true
+hostname.workspace = true
+keyring.workspace = true
+btleplug.workspace = true
+mdns-sd.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+sha2.workspace = true
+futures = "0.3"
