@@ -268,7 +268,7 @@ pub async fn pair_near_start(
 ) -> std::result::Result<serde_json::Value, String> {
     use dfabric::ble::BleSession;
 
-    let found = dfabric::ble::scan(std::time::Duration::from_secs(scan_secs.max(5)))
+    let (scan_handle, found) = dfabric::ble::scan(std::time::Duration::from_secs(scan_secs.max(5)))
         .await
         .map_err(err_to_string)?;
     for p in found {
@@ -278,25 +278,38 @@ pub async fn pair_near_start(
             Err(_) => continue,
         };
         if !pairing {
+            session.disconnect().await;
             continue;
         }
-        let store = dfabric::open_store().map_err(err_to_string)?;
-        let name = dfabric::display_name(&store);
+        scan_handle.stop().await;
+        let name = dfabric::open_store()
+            .map(|store| dfabric::display_name(&store))
+            .unwrap_or_else(|_| df_core::names::default_device_name());
         // eid 取自 INFO；DF-NEAR-1 必须由本端先发 NEAR_COMMIT，这里再等节点说话会一直等到
         // 节点判空闲断开（约 60 秒）。加超时保证命令不会无限挂起。
-        let hs = tokio::time::timeout(
+        let hs = match tokio::time::timeout(
             std::time::Duration::from_secs(20),
             df_core::pairing::near::near_prepare(&mut session, &eid, &name),
         )
         .await
-        .map_err(|_| "附近配对握手超时（请确认手机仍停在「添加设备」窗口）".to_string())?
-        .map_err(err_to_string)?;
+        {
+            Ok(Ok(hs)) => hs,
+            Ok(Err(e)) => {
+                session.disconnect().await;
+                return Err(err_to_string(e));
+            }
+            Err(_) => {
+                session.disconnect().await;
+                return Err("附近配对握手超时（请确认手机仍停在「添加设备」窗口）".to_string());
+            }
+        };
         let sas = hs.sas();
         let node_id = hs.node_id().to_string();
         *state.handshake.lock().await = Some(hs);
         *state.session.lock().await = Some(session);
         return Ok(serde_json::json!({ "sas": sas, "label": label, "nodeId": node_id }));
     }
+    scan_handle.stop().await;
     Err("没有处于「添加设备」窗口的设备（请先在手机上点「添加设备」）".into())
 }
 
@@ -311,9 +324,9 @@ pub async fn pair_near_confirm(
     let (Some(hs), Some(mut session)) = (hs, session) else {
         return Err("没有进行中的配对".into());
     };
-    let pr = df_core::pairing::near::near_confirm(&mut session, &hs)
-        .await
-        .map_err(err_to_string)?;
+    let result = df_core::pairing::near::near_confirm(&mut session, &hs).await;
+    session.disconnect().await;
+    let pr = result.map_err(err_to_string)?;
     let trust = df_core::stores::Trust::from_pair_result(&pr);
     dfabric::secrets::protect_trust(&trust);
     let store = dfabric::open_store().map_err(err_to_string)?;
@@ -329,6 +342,7 @@ pub async fn pair_near_cancel(state: tauri::State<'_, PairState>) -> std::result
     let session = state.session.lock().await.take();
     if let (Some(_), Some(mut session)) = (hs, session) {
         let _ = df_core::pairing::near::near_cancel(&mut session).await;
+        session.disconnect().await;
     }
     Ok(())
 }

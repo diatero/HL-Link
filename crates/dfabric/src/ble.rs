@@ -58,36 +58,86 @@ pub async fn adapter_available() -> Result<String> {
 }
 
 /// 扫描发现（有超时，找到即返回；桌面端不要常驻扫描）。
-pub async fn scan(timeout: Duration) -> Result<Vec<Peripheral>> {
+///
+/// 返回的 [`ScanHandle`] 持有适配器：**调用方必须在连接尝试结束后调用
+/// `stop()`**。不要在返回前停止扫描——BlueZ 在停止 discovery 后会移除刚发现的
+/// 设备对象，随后的 GATT connect 会以 `le-connection-abort-by-local` 失败。
+pub async fn scan(timeout: Duration) -> Result<(ScanHandle, Vec<Peripheral>)> {
+    use btleplug::api::CentralEvent;
     let adapter: Adapter = first_adapter().await?;
     df_core::logging::debug("ble", format!("开始扫描 _dfabric 服务（{timeout:?}）"));
 
+    // 先订阅事件再开始扫描：只接受本次扫描期间真正收到广播的设备。
+    // BlueZ 会缓存已消失的设备对象，而节点每次重启广播（约 2 分钟轮换 eid）都换随机地址，
+    // 直接列 peripherals() 会拿到连不上的旧对象（Connect 报 "doesn't exist" 或超时）。
+    let mut events = adapter
+        .events()
+        .await
+        .map_err(|e| DfError::Ble(format!("订阅扫描事件: {e}")))?;
     adapter
         .start_scan(ScanFilter { services: vec![service_uuid()] })
         .await
         .map_err(|e| DfError::Ble(format!("启动扫描: {e}")))?;
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let mut found: Vec<Peripheral> = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        for p in adapter.peripherals().await.map_err(|e| DfError::Ble(e.to_string()))? {
-            if p.is_connected().await.unwrap_or(false) {
-                continue;
-            }
-            if let Ok(Some(props)) = p.properties().await {
-                if props.services.contains(&service_uuid()) && !found.iter().any(|f| f.id() == p.id()) {
-                    found.push(p);
-                }
-            }
-        }
-        if !found.is_empty() {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let event = match tokio::time::timeout(remaining, events.next()).await {
+            Ok(Some(ev)) => ev,
+            _ => break,
+        };
+        let (id, kind) = match event {
+            CentralEvent::DeviceDiscovered(id) => (id, "discovered"),
+            CentralEvent::DeviceUpdated(id) => (id, "updated"),
+            CentralEvent::ServiceDataAdvertisement { id, .. } => (id, "service-data"),
+            CentralEvent::ServicesAdvertisement { id, .. } => (id, "services"),
+            _ => continue,
+        };
+        if found.iter().any(|f| f.id() == id) {
+            continue;
+        }
+        let Ok(p) = adapter.peripheral(&id).await else { continue };
+        if p.is_connected().await.unwrap_or(false) {
+            continue;
+        }
+        if let Ok(Some(props)) = p.properties().await {
+            // RSSI 只在本次 discovery 收到广播后才有：订阅事件时 btleplug 会把 BlueZ 缓存的旧对象
+            // 当作 discovered（RSSI None）重放，节点轮换广播地址后这些对象连接会挂 30 秒再失败。
+            if props.rssi.is_none() {
+                continue;
+            }
+            // RSSI 只在本次 discovery 收到广播后才有：订阅事件时 btleplug 会把 BlueZ 缓存的旧对象
+            // 当作 discovered（RSSI None）重放，节点轮换广播地址后这些对象连接会挂 30 秒再失败。
+            if props.rssi.is_none() {
+                continue;
+            }
+            if props.services.contains(&service_uuid()) || props.service_data.contains_key(&service_uuid()) {
+                df_core::logging::debug(
+                    "ble",
+                    format!("候选 {}（事件 {kind}，RSSI {:?}，eid {:?}）", props.address, props.rssi,
+                        props.service_data.get(&service_uuid()).map(hex::encode)),
+                );
+                found.push(p);
+                // 发现第一台后再收集 1.5 秒，附近有多台节点时一并尝试
+                deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(1500));
+            }
+        }
     }
-    let _ = adapter.stop_scan().await;
     df_core::logging::info("ble", format!("扫描结束：{} 个候选设备", found.len()));
-    Ok(found)
+    Ok((ScanHandle(adapter), found))
+}
+
+/// 扫描停止句柄：显式结束 discovery（避免 BlueZ 移除待连接的设备对象）。
+pub struct ScanHandle(Adapter);
+
+impl ScanHandle {
+    pub async fn stop(&self) {
+        let _ = self.0.stop_scan().await;
+    }
 }
 
 /// 已连接的 BLE 会话（实现了 GattLink，可跑 DF-BLE-1 认证与附近配对）。
@@ -102,7 +152,31 @@ pub struct BleSession {
 
 impl BleSession {
     /// 连接 + 服务发现 + 订阅 TX + 读 INFO（6.1 节顺序）。
+    ///
+    /// Linux BlueZ 上 connect 偶发 `le-connection-abort-by-local`（HCI 本地中止，
+    /// 常见于连接建立期间 discovery 竞争），这里做最多 3 次重试。
     pub async fn connect(peripheral: Peripheral) -> Result<(BleSession, String, bool)> {
+        let mut last_err = None;
+        for attempt in 0..3 {
+            match Self::connect_once(&peripheral).await {
+                Ok(x) => return Ok(x),
+                Err(e) => {
+                    // 通知流/特征缺失等非瞬时错误不重试；设备对象已被 BlueZ 移除（地址已轮换）也不重试
+                    let transient = matches!(e, DfError::Ble(ref m)
+                        if (m.contains("连接失败") || m.contains("服务发现")) && !m.contains("doesn't exist") && !m.contains("UnknownObject"));
+                    if !transient {
+                        return Err(e);
+                    }
+                    df_core::logging::warn("ble", format!("连接失败（第 {} 次）：{e}", attempt + 1));
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| DfError::Ble("连接失败".into())))
+    }
+
+    async fn connect_once(peripheral: &Peripheral) -> Result<(BleSession, String, bool)> {
         peripheral
             .connect()
             .await
@@ -153,7 +227,7 @@ impl BleSession {
 
         let mtu = detect_mtu(&peripheral).await;
         Ok((
-            BleSession { peripheral, rx, tx, notifications, mtu, pending: Default::default() },
+            BleSession { peripheral: peripheral.clone(), rx, tx, notifications, mtu, pending: Default::default() },
             eid,
             pairing,
         ))
@@ -163,6 +237,75 @@ impl BleSession {
     pub fn mtu(&self) -> u16 {
         self.mtu
     }
+
+    /// 断开 GATT 连接（不常驻占用 BLE 连接；节点侧会话也随之失效）。
+    pub async fn disconnect(&mut self) {
+        let _ = self.peripheral.disconnect().await;
+    }
+}
+
+/// 已配对设备的 BLE 控制链路（DF1.md「BLE framing and authentication」）：
+/// 扫描 → GATT → 用该设备的 bleKey 完成 DF-BLE-1 认证 → 加密 LINK_REQUEST。
+/// 用于 LAN 地址失效（手机换网/DHCP 换址、mDNS 不通）时向节点要当前地址，
+/// `p2p` 为 true 时请求节点建立 Wi-Fi Direct GO 并等到组就绪。
+///
+/// 广播里没有身份：附近可能有多台节点，逐个尝试，认证失败（hint 不匹配，节点回 AUTH_FAILED）
+/// 即换下一个。结果只是连接提示，身份仍以 TLS（节点 CA）+ HELLO_ACK nodeId 为准。
+pub async fn link_request(
+    trust: &df_core::stores::Trust,
+    p2p: bool,
+    scan_timeout: Duration,
+) -> Result<df_core::pairing::ble_auth::LinkReady> {
+    let key_b64 = trust
+        .ble_key_b64
+        .as_deref()
+        .ok_or_else(|| DfError::Ble("该设备没有 bleKey（导入的配对结果不含 BLE 密钥）".into()))?;
+    let key: [u8; 32] = df_core::crypto::b64_decode(key_b64)?
+        .try_into()
+        .map_err(|_| DfError::Ble("bleKey 不是 32 字节".into()))?;
+
+    let (mut scan_handle, mut found) = scan(scan_timeout).await?;
+    if found.is_empty() {
+        // 节点约每 2 分钟换地址重启广播，偶有整轮扫描都错过的情况：再扫一轮
+        scan_handle.stop().await;
+        (scan_handle, found) = scan(scan_timeout).await?;
+    }
+    let mut last_err = DfError::Ble("附近没有发现 DeviceFabric 节点（手机蓝牙关闭或节点未开启）".into());
+    for p in found {
+        let (mut session, eid, _) = match BleSession::connect(p).await {
+            Ok(x) => x,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        let result = async {
+            let mut ch = df_core::pairing::ble_auth::authenticate(&mut session, &key, &trust.node_id, &eid).await?;
+            if p2p {
+                df_core::pairing::ble_auth::link_request_p2p(&mut ch, &mut session).await
+            } else {
+                df_core::pairing::ble_auth::link_request_lan(&mut ch, &mut session).await
+            }
+        }
+        .await;
+        session.disconnect().await;
+        match result {
+            Ok(ready) => {
+                scan_handle.stop().await;
+                df_core::logging::info(
+                    "ble",
+                    format!("BLE 链路就绪：地址 {:?}，P2P 组 {}", ready.addresses, if ready.group_ready() { "就绪" } else { "未建立" }),
+                );
+                return Ok(ready);
+            }
+            Err(e) => {
+                df_core::logging::debug("ble", format!("BLE 认证/链路请求失败：{e}"));
+                last_err = e;
+            }
+        }
+    }
+    scan_handle.stop().await;
+    Err(last_err)
 }
 
 fn uuid_of(s: &str) -> Uuid {

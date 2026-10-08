@@ -99,6 +99,7 @@ pub async fn upload(
                         "CHUNK_ACK 序号不匹配: 期望 {index}, 收到 {chunk_index}"
                     )));
                 }
+                done.insert(index);
                 if let Some(p) = persist_done.as_mut() {
                     p(done);
                 }

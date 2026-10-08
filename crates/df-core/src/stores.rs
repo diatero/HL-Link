@@ -115,6 +115,30 @@ impl Store {
         self.save_trusts(&list)
     }
 
+    /// 记录最近一次连通的地址（只是连接提示；只改这一字段，按文件当前内容重写）。
+    pub fn set_last_addr(&self, node_id: &str, addr: &str) -> Result<()> {
+        let mut list = self.trusts();
+        match list.iter_mut().find(|t| t.node_id == node_id) {
+            Some(t) if t.last_addr.as_deref() != Some(addr) => {
+                t.last_addr = Some(addr.to_string());
+                self.save_trusts(&list)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 标记信任已失效（节点对本机证书回 AUTH_FAILED：手机上已解除信任）。
+    pub fn set_revoked(&self, node_id: &str) -> Result<()> {
+        let mut list = self.trusts();
+        match list.iter_mut().find(|t| t.node_id == node_id) {
+            Some(t) if !t.revoked => {
+                t.revoked = true;
+                self.save_trusts(&list)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 删除信任（UI 提醒用户在手机上解除信任）。
     pub fn remove_trust(&self, node_id: &str) -> Result<bool> {
         let mut list = self.trusts();

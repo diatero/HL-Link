@@ -10,11 +10,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const CANDIDATE_TTL: Duration = Duration::from_secs(15);
+/// 候选时效：mdns-sd 只在服务首次解析/记录变化时发 ServiceResolved，之后靠缓存刷新，
+/// 不会每 15 秒重发；时效太短会让 Agent 在首次解析之后就丢掉手机地址。
+/// 服务下线（ServiceRemoved）时立即清除。
+const CANDIDATE_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 pub struct MdnsBrowser {
-    candidates: Arc<RwLock<HashMap<IpAddr, Instant>>>,
+    candidates: Arc<RwLock<HashMap<IpAddr, (Instant, String)>>>,
 }
 
 impl MdnsBrowser {
@@ -32,13 +35,22 @@ impl MdnsBrowser {
         tokio::task::spawn_blocking(move || {
             df_core::logging::info("mdns", format!("开始浏览 {MDNS_SERVICE}"));
             while let Ok(event) = receiver.recv() {
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    for ip in info.get_addresses() {
-                        df_core::logging::debug("mdns", format!("候选地址 {ip}（{}）", info.get_fullname()));
-                        if let Ok(mut m) = candidates.try_write() {
-                            m.insert(*ip, Instant::now());
+                match event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        let fullname = info.get_fullname().to_string();
+                        let mut m = candidates.blocking_write();
+                        // 同一服务的旧地址作废（手机换网后只保留新地址）
+                        m.retain(|_, (_, name)| *name != fullname);
+                        for ip in info.get_addresses() {
+                            df_core::logging::debug("mdns", format!("候选地址 {ip}（{fullname}）"));
+                            m.insert(*ip, (Instant::now(), fullname.clone()));
                         }
                     }
+                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                        df_core::logging::debug("mdns", format!("服务下线 {fullname}"));
+                        candidates.blocking_write().retain(|_, (_, name)| *name != fullname);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -48,7 +60,7 @@ impl MdnsBrowser {
     /// 当前新鲜候选（≤15 秒）。
     pub async fn snapshot(&self) -> Vec<String> {
         let mut m = self.candidates.write().await;
-        m.retain(|_, t| t.elapsed() < CANDIDATE_TTL);
+        m.retain(|_, (t, _)| t.elapsed() < CANDIDATE_TTL);
         let mut ips: Vec<IpAddr> = m.keys().copied().collect();
         // 优先私网地址
         ips.sort_by_key(|ip| match ip {

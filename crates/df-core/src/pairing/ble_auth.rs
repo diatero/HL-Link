@@ -59,9 +59,11 @@ impl SecureChannel {
         nonce[4..].copy_from_slice(&seq.to_be_bytes());
         let aad = format!("{}\n{}\n{}", self.session_id, direction, seq);
         let ct = gcm_seal(key, &nonce, aad.as_bytes(), plaintext)?;
+        // 节点 BleControl 用 Wire.decimal(m, "seq") 解析：seq 必须是规范十进制字符串，
+        // JSON 数字会被判 INVALID_FRAME。
         let v = serde_json::json!({
             "type": "SECURE",
-            "seq": seq,
+            "seq": fields::dec(seq),
             "data": b64_encode(&ct),
         });
         Ok(v)
@@ -82,7 +84,16 @@ impl SecureChannel {
             return Err(DfError::Ble("c2s 序号耗尽，需重新认证".into()));
         }
         let seq = self.seq_c2s;
-        let plaintext = serde_json::to_vec(&serde_json::json!({ "type": kind, "body": body }))?;
+        // 内层明文必须是平铺的 `{type, ...}`：节点 BleControl 直接在解密后的对象上
+        // `request.getString("transport")`，包一层 body 会抛 JSONException。
+        let mut plaintext = serde_json::Map::new();
+        plaintext.insert("type".into(), serde_json::Value::String(kind.to_string()));
+        if let serde_json::Value::Object(map) = body {
+            for (k, v) in map {
+                plaintext.insert(k, v);
+            }
+        }
+        let plaintext = serde_json::Value::Object(plaintext).to_string().into_bytes();
         let key = self.c2s_key;
         let prefix = self.c2s_nonce;
         let wrapper = self.seal("c2s", &key, &prefix, seq, &plaintext)?;
@@ -97,6 +108,13 @@ impl SecureChannel {
         let v: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|e| DfError::Protocol(format!("SECURE 帧不是 JSON: {e}")))?;
         let t = fields::need_str(&v, &["type"], "type")?;
+        // 节点处理失败时回明文 {type:ERROR, code} 并作废本会话（BleControl.onCharacteristicWriteRequest）
+        if t == "ERROR" {
+            return Err(DfError::Remote {
+                code: fields::get_str(&v, &["code"]).unwrap_or_else(|| "UNKNOWN".into()),
+                retryable: false,
+            });
+        }
         if t != "SECURE" {
             return Err(DfError::Ble(format!("期望 SECURE，收到 {t}")));
         }
@@ -113,7 +131,9 @@ impl SecureChannel {
         let inner: serde_json::Value = serde_json::from_slice(&plaintext)
             .map_err(|e| DfError::Protocol(format!("SECURE 内层不是 JSON: {e}")))?;
         let kind = fields::need_str(&inner, &["type"], "type")?;
-        Ok((kind, inner.get("body").cloned().unwrap_or(serde_json::Value::Null)))
+        // 节点的 LINK_READY 明文没有 body 包装：type/group/controlPort/dataPort/addresses
+        // 都在顶层（与 df_client.py 的解析一致），直接返回整个对象。
+        Ok((kind, inner))
     }
 }
 
@@ -289,6 +309,36 @@ mod tests {
         let h = hint_for(&key, "aabbccdd00112233");
         assert_eq!(h.len(), 32);
         assert!(h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+    }
+
+    /// 与 `protocol/vectors.json`（节点仓库公开向量）逐项对拍。
+    #[test]
+    fn df1_public_vectors() {
+        let key: [u8; 32] = hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let node_id = "0".repeat(64);
+        let eid = "0011223344556677";
+        let cn = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+        let sn = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=";
+        assert_eq!(hint_for(&key, eid), "fcc732a926f1333781469009498ff54b");
+        let t = transcript(&node_id, eid, cn, sn);
+        let mac = |s: &str| encode_mac(&hmac_sha256(&key, format!("{t}\n{s}").as_bytes()));
+        assert_eq!(mac("server"), "HQXGnQgNGpjBSKgPLIiNrOsiEAom1jz2mlC/MiE+qkw=");
+        assert_eq!(mac("client"), "ukPGuoYzzNxUjvaY8EyaC0EoyAVyF2RvGgqkr9gJeJs=");
+        assert_eq!(mac("session"), "vvE2qsBlwDLzf+HWz0d7Wzx8JwdWcBOpvKG+36n+7tI=");
+        let mut ch = session_keys(&key, &node_id, eid, cn, sn).unwrap();
+        let okm = [&ch.c2s_key[..], &ch.s2c_key[..], &ch.c2s_nonce[..], &ch.s2c_nonce[..]].concat();
+        assert_eq!(
+            hex::encode(okm),
+            "455cb706749f229f98e76ef6c5bde2630f5e8c17ae7176100340c9f77166a437c08199a0a2838d905d7ab06b06a8815b0529ebcdf3169b42f86dda5e055c2de5c6076817896b0ae9"
+        );
+        ch.session_id = mac("session");
+        let (k, p) = (ch.c2s_key, ch.c2s_nonce);
+        let sealed = ch.seal("c2s", &k, &p, 0, br#"{"type":"LINK_REQUEST","transport":"LAN"}"#).unwrap();
+        assert_eq!(sealed["seq"], "0");
+        assert_eq!(sealed["data"], "8HIQGWZnk1ZooW4YumLUj9T6ZYwLkHWAFj8FvEnsLsj8TcxZrPSnmuGXvfDlmYyVN6Fs76ApcGcr");
     }
 
     #[test]

@@ -189,7 +189,26 @@ impl Agent {
             df_core::logging::warn("agent", format!("mDNS 启动失败：{e}"));
         }
 
+        // 上次退出时正在发送的任务：重新排队，按原 transferId/元数据续传（只补缺块）
+        let mut sends = load_sends();
+        let mut pending = 0;
+        for r in sends.iter_mut() {
+            if r.state == "sending" {
+                r.state = "queued".into();
+            }
+            if r.state == "queued" || r.state == "queued-text" {
+                pending += 1;
+            }
+        }
+        if pending > 0 {
+            save_sends(&sends).ok();
+            df_core::logging::info("agent", format!("恢复 {pending} 个未完成的发送任务"));
+        }
+
         let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        if pending > 0 {
+            let _ = queue_tx.send(());
+        }
         let agent = std::sync::Arc::new(Agent { store, mdns, queue_tx });
         let a2 = agent.clone();
         tokio::spawn(async move { send_worker(a2, queue_rx).await });
@@ -305,9 +324,8 @@ async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
 
     let staged = agent.store.staging_dir().join(&rec.meta.transfer_id);
     let mut done = df_core::bitmap::decode_bits(&rec.done_b64, rec.meta.chunk_count()).unwrap_or_default();
-    let mut rec2 = rec.clone();
-    rec2.state = "sending".into();
-    update_send(rec2).ok();
+    rec.state = "sending".into();
+    update_send(rec.clone()).ok();
 
     let meta = rec.meta.clone();
     let mut persist = |set: &BTreeSet<u64>| {
@@ -339,22 +357,32 @@ async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
 }
 
 /// 接收轮询：每 3 秒 PULL_LIST（独立控制会话，不与发送共用）。
+///
+/// 每个节点保持一条已认证的控制连接反复 PULL_LIST（DF1.md FILE_SEND 扩展），
+/// 不再每 3 秒重新 TLS 握手：手机端每次握手都要用 AndroidKeyStore 签名。
+/// 连接出错（节点换网关闭了 socket、空闲超时、信任被撤销）时丢弃并在下一轮重连；
+/// 本机显示名称改变时也重连，让新名称通过 HELLO 同步到手机。
 async fn receive_poller(agent: std::sync::Arc<Agent>) {
     df_core::logging::info("agent", "接收轮询已启动（每 3 秒 PULL_LIST；接受前不拉取任何字节）");
     let mut last_err: Option<String> = None;
+    let mut sessions: std::collections::HashMap<String, (df_core::session::ControlSession, String)> =
+        std::collections::HashMap::new();
     loop {
         let trusts = agent.store.trusts();
+        sessions.retain(|id, _| trusts.iter().any(|t| &t.node_id == id && !t.revoked));
         let mut errored: Option<String> = None;
+        let mut polled = 0;
         for trust in trusts.iter().filter(|t| !t.revoked) {
-            if let Err(e) = poll_one(&agent, trust).await {
-                errored = Some(e.to_string());
+            match poll_one(&agent, trust, &mut sessions).await {
+                Ok(()) => polled += 1,
+                Err(e) => errored = Some(e.to_string()),
             }
         }
         // 只在状态变化时记录，避免每 3 秒刷屏
         if errored != last_err {
             match &errored {
                 Some(msg) => df_core::logging::debug("recv", format!("接收轮询未能连接：{msg}")),
-                None if last_err.is_some() => df_core::logging::info("recv", "接收轮询已恢复连接"),
+                None if last_err.is_some() && polled > 0 => df_core::logging::info("recv", "接收轮询已恢复连接"),
                 None => {}
             }
             last_err = errored;
@@ -363,12 +391,35 @@ async fn receive_poller(agent: std::sync::Arc<Agent>) {
     }
 }
 
-async fn poll_one(agent: &Agent, trust: &Trust) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
+async fn poll_one(
+    agent: &Agent,
+    trust: &Trust,
+    sessions: &mut std::collections::HashMap<String, (df_core::session::ControlSession, String)>,
+) -> Result<()> {
     let name = display_name(&agent.store);
-    let mut ctrl = connect_trust(trust, Some(&name), &agent.mdns).await?;
-    let list = df_core::transfer::down::pull_list(&mut ctrl).await?;
-    let _ = ctrl.stream.shutdown().await;
+    if sessions.get(&trust.node_id).is_some_and(|(_, n)| *n != name) {
+        sessions.remove(&trust.node_id);
+    }
+    // 复用的连接可能已被节点关闭：失败一次就丢弃并用新连接重试一次
+    let list = match sessions.get_mut(&trust.node_id) {
+        Some((ctrl, _)) => match df_core::transfer::down::pull_list(ctrl).await {
+            Ok(list) => Some(list),
+            Err(_) => {
+                sessions.remove(&trust.node_id);
+                None
+            }
+        },
+        None => None,
+    };
+    let list = match list {
+        Some(list) => list,
+        None => {
+            let mut ctrl = connect_trust(trust, Some(&name), &agent.mdns).await?;
+            let list = df_core::transfer::down::pull_list(&mut ctrl).await?;
+            sessions.insert(trust.node_id.clone(), (ctrl, name));
+            list
+        }
+    };
 
     let mut pulls = load_pulls();
     for offer in &list.offers {
@@ -400,12 +451,13 @@ async fn poll_one(agent: &Agent, trust: &Trust) -> Result<()> {
         update_pull(rec).ok();
         notify("收到文件请求", &format!("{} 想发送「{}」", trust.name.as_deref().unwrap_or("Lineage 设备"), offer.meta.name));
     }
+    // 手机端取消了尚未完成的发送；只在状态真正变化时写盘（ended 每轮都会带上全部历史记录）
     for ended in &list.ended {
         if let Some(p) = pulls.iter_mut().find(|p| p.transfer_id == ended.transfer_id) {
-            if ended.state.contains("CANCEL") {
+            if ended.state.contains("CANCEL") && (p.state == "pending" || p.state == "accepted") {
                 p.state = "cancelled".into();
+                update_pull(p.clone()).ok();
             }
-            update_pull(p.clone()).ok();
         }
     }
     Ok(())
@@ -550,8 +602,12 @@ pub async fn accept_pull(
     transfer_id: &str,
 ) -> Result<String> {
     let pulls = load_pulls();
-    let Some(rec) = pulls.iter().find(|p| p.transfer_id == transfer_id && p.state == "pending") else {
-        return Err(DfError::Protocol("没有该待接收项（或状态不是 pending）".into()));
+    // accepted = 上次接收中断（位图记录已落盘的块），允许再次接受以续传
+    let Some(rec) = pulls
+        .iter()
+        .find(|p| p.transfer_id == transfer_id && (p.state == "pending" || p.state == "accepted"))
+    else {
+        return Err(DfError::Protocol("没有该待接收项（或状态不是 pending / accepted）".into()));
     };
     let Some(trust) = find_trust(store, &rec.node_id) else {
         return Err(DfError::Protocol("节点不存在".into()));
@@ -575,9 +631,13 @@ pub async fn accept_pull(
     let mut ctrl = connect_trust(&trust, Some(&name), mdns).await?;
     let ack_session = ctrl.hello_session_id.clone();
 
-    // 稀疏预分配 + 崩溃恢复由 journal（pulls.json 位图）支撑
+    // 稀疏预分配 + 崩溃恢复由 journal（pulls.json 位图）支撑。不能截断：
+    // 续传时暂存文件里是位图记录的已确认块。暂存文件丢失则位图作废，从头接收。
     std::fs::create_dir_all(store.staging_dir())?;
-    std::fs::File::create(&staging)?.set_len(meta.size)?;
+    if !staging.exists() {
+        done.clear();
+    }
+    std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&staging)?.set_len(meta.size)?;
 
     let mut rec_mut = rec.clone();
     rec_mut.state = "accepted".into();

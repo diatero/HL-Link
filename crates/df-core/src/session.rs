@@ -38,7 +38,9 @@ impl ControlSession {
         let connector = TlsConnector::from(config);
         // 以实际连接的 IP 作为服务器名（要求 leaf 的 IP SAN 匹配）
         let server_name = rustls::pki_types::ServerName::IpAddress(addr.into());
-        let stream = timeout(connect_timeout, connector.connect(server_name, tcp))
+        // TCP 不通要快速失败（换候选地址）；TLS 握手则要宽一些：节点用 AndroidKeyStore 签名，
+        // 偶尔超过 2 秒，过早放弃会让调用方误判为不可达而绕去 BLE。
+        let stream = timeout(connect_timeout.max(Duration::from_secs(8)), connector.connect(server_name, tcp))
             .await
             .map_err(|_| DfError::Timeout("TLS 握手超时".into()))?
             .map_err(|e| {
@@ -92,6 +94,12 @@ impl ControlSession {
         let env = timeout(HELLO_TIMEOUT + Duration::from_secs(5), self.hello_raw(&body))
             .await
             .map_err(|_| DfError::Timeout("HELLO 超时".into()))??;
+        // 节点拒绝（客户端证书不再受信任 → AUTH_FAILED）时回 ERROR 并关闭连接
+        if env.kind == "ERROR" {
+            let e = ErrorBody::from_value(&env.body)?;
+            crate::logging::warn("session", format!("HELLO 被节点拒绝：{}", e.code));
+            return Err(DfError::Remote { code: e.code, retryable: e.retryable });
+        }
         if env.kind != "HELLO_ACK" {
             crate::logging::warn("session", format!("HELLO 未得到 HELLO_ACK：{}", env.kind));
             return Err(DfError::Protocol(format!("期望 HELLO_ACK，收到 {}", env.kind)));

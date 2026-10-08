@@ -197,7 +197,8 @@ pub async fn pull_accept(
                 data.send_json(&Envelope::new(
                     "CHUNK_ACK",
                     &bind_rid, // requestId 与 bind 相同
-                    serde_json::json!({ "chunkIndex": index }),
+                    // 节点 sendFile 用 Wire.decimal(a, "chunkIndex") 解析：必须是规范十进制字符串
+                    serde_json::json!({ "chunkIndex": fields::dec(index) }),
                 ))
                 .await?;
                 if let Some(p) = on_progress.as_mut() {
@@ -211,8 +212,16 @@ pub async fn pull_accept(
         }
     }
 
-    // 校验整文件长度与 SHA-256
+    // 节点发完全部缺失块后关闭数据连接；提前关闭（取消/断网）时保留已确认块，留待续传
     drop(file);
+    if (done.len() as u64) < total_chunks {
+        return Err(DfError::Timeout(format!(
+            "数据连接提前关闭：已接收 {}/{total_chunks} 块，可重新接受以续传",
+            done.len()
+        )));
+    }
+
+    // 校验整文件长度与 SHA-256（流式计算，避免大文件整读进内存）
     let staged_len = tokio::fs::metadata(staging).await?.len();
     if staged_len != meta.size {
         return Err(DfError::Protocol(format!(
@@ -220,9 +229,7 @@ pub async fn pull_accept(
             meta.size
         )));
     }
-    let whole = tokio::fs::read(staging).await?;
-    let whole_hash = hex::encode(crate::crypto::sha256(&whole));
-    drop(whole);
+    let whole_hash = hash_file(staging).await?;
     if whole_hash != meta.sha256 {
         return Err(DfError::Protocol(format!(
             "整文件 SHA-256 不符: 期望 {}, 实际 {whole_hash}",
@@ -266,6 +273,23 @@ async fn sync_staging(file: &tokio::fs::File) -> Result<()> {
         file.sync_all().await?;
         Ok(())
     }
+}
+
+/// 整文件 SHA-256（小写 hex），按 1 MiB 分段读取。
+async fn hash_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// 生成收件位置（不覆盖已有文件）。

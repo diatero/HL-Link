@@ -69,6 +69,16 @@ enum Cmd {
     },
     /// 删除信任设备（同时提醒在手机上解除信任）
     Remove { node_id: String },
+    /// 经 BLE 认证链路（DF-BLE-1）向手机请求当前连接信息；--p2p 请求建立 Wi-Fi Direct 组
+    Link {
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        p2p: bool,
+        /// 扫描时长（秒）
+        #[arg(long, default_value_t = 10)]
+        scan_secs: u64,
+    },
     /// 自检：协议核心 + 本机环境 + 已配对设备（不修改任何数据）
     Selftest {
         /// 以 JSON 输出（便于附到问题报告）
@@ -128,6 +138,20 @@ async fn run(cmd: Cmd) -> Result<()> {
     df_core::tls::ensure_provider();
     match cmd {
         Cmd::PairNear { scan_secs } => pair_near(Duration::from_secs(scan_secs)).await,
+        Cmd::Link { to, p2p, scan_secs } => {
+            let store = dfabric::open_store()?;
+            dfabric::secrets::restore_secrets_into_trusts(&store);
+            let trust = dfabric::pick_trust(&store, to.as_deref())?;
+            let ready = dfabric::ble::link_request(&trust, p2p, Duration::from_secs(scan_secs)).await?;
+            // 组口令只在认证后的 BLE 通道里传输，这里不打印
+            println!("地址: {:?}  控制端口 {}  数据端口 {}", ready.addresses, ready.control_port, ready.data_port);
+            if ready.group_ready() || !ready.group_name.is_empty() {
+                println!("P2P 组: {}  GO {}  状态 {}", ready.group_name, ready.go_address, ready.group_state);
+            } else {
+                println!("P2P 组: 未建立");
+            }
+            Ok(())
+        }
         Cmd::PairImport { file } => {
             let json = std::fs::read_to_string(&file)
                 .map_err(|e| DfError::Protocol(format!("读取导出文件失败: {e}")))?;
@@ -288,64 +312,76 @@ async fn try_ipc(cmd: IpcCommand) -> Option<IpcReply> {
 async fn pair_near(scan: Duration) -> Result<()> {
     use dfabric::ble::BleSession;
     println!("正在扫描附近的 DeviceFabric 设备（请先在手机上点「添加设备」）…");
-    let found = dfabric::ble::scan(scan).await?;
-    if found.is_empty() {
-        return Err(DfError::Ble("未发现设备：确认手机蓝牙已开且处于配对窗口内".into()));
-    }
-    for p in found {
-        use btleplug::api::Peripheral as _;
-        let props = p.properties().await.ok().flatten();
-        let label = props
-            .as_ref()
-            .and_then(|pr| pr.local_name.clone())
-            .unwrap_or_else(|| "附近的 Lineage 设备".into());
-        println!("尝试连接: {label}");
-        let (mut session, eid, pairing) = match BleSession::connect(p).await {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("  跳过（{e}）");
+    // 扫描句柄在连接尝试结束前保持 discovery 运行：BlueZ 停止扫描会移除设备对象，
+    // 导致 GATT connect 以 le-connection-abort-by-local 失败。
+    let (scan_handle, found) = dfabric::ble::scan(scan).await?;
+    let mut stopped = false;
+    let result: Result<()> = (|| async {
+        for p in found {
+            use btleplug::api::Peripheral as _;
+            let props = p.properties().await.ok().flatten();
+            let label = props
+                .as_ref()
+                .and_then(|pr| pr.local_name.clone())
+                .unwrap_or_else(|| "附近的 Lineage 设备".into());
+            println!("尝试连接: {label}");
+            let (mut session, eid, pairing) = match BleSession::connect(p).await {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("  跳过（{e}）");
+                    continue;
+                }
+            };
+            if !pairing {
+                eprintln!("  跳过（该设备未处于添加设备窗口）");
+                session.disconnect().await;
                 continue;
             }
-        };
-        if !pairing {
-            eprintln!("  跳过（该设备未处于添加设备窗口）");
-            continue;
-        }
-        let store = dfabric::open_store()?;
-        let name = dfabric::display_name(&store);
-        // eid 必须取自刚才读到的 INFO：DF-NEAR-1 由本端先发 NEAR_COMMIT，
-        // 在这里等节点先说话会一直等到节点判空闲断开。
-        let hs = tokio::time::timeout(
-            Duration::from_secs(20),
-            df_core::pairing::near::near_prepare(&mut session, &eid, &name),
-        )
-        .await
-        .map_err(|_| DfError::Timeout("附近配对握手超时（请确认手机仍停在「添加设备」窗口）".into()))??;
-        println!();
-        println!("  ╔══════════════════════╗");
-        println!("  ║  验证码: {}         ║", hs.sas());
-        println!("  ╚══════════════════════╝");
-        println!("请在手机上确认显示相同的 6 位验证码，确认后在这里输入 y 继续（其他键取消）：");
-        let mut line = String::new();
-        std::io::stdout().flush().ok();
-        std::io::stdin().read_line(&mut line)?;
-        if !line.trim().eq_ignore_ascii_case("y") {
-            df_core::pairing::near::near_cancel(&mut session).await?;
-            println!("已取消");
+            scan_handle.stop().await;
+            stopped = true;
+            let store = dfabric::open_store()?;
+            let name = dfabric::display_name(&store);
+            // eid 必须取自刚才读到的 INFO：DF-NEAR-1 由本端先发 NEAR_COMMIT，
+            // 在这里等节点先说话会一直等到节点判空闲断开。
+            let hs = tokio::time::timeout(
+                Duration::from_secs(20),
+                df_core::pairing::near::near_prepare(&mut session, &eid, &name),
+            )
+            .await
+            .map_err(|_| DfError::Timeout("附近配对握手超时（请确认手机仍停在「添加设备」窗口）".into()))??;
+            println!();
+            println!("  ╔══════════════════════╗");
+            println!("  ║  验证码: {}         ║", hs.sas());
+            println!("  ╚══════════════════════╝");
+            println!("请在手机上确认显示相同的 6 位验证码，确认后在这里输入 y 继续（其他键取消）：");
+            let mut line = String::new();
+            std::io::stdout().flush().ok();
+            std::io::stdin().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                let _ = df_core::pairing::near::near_cancel(&mut session).await;
+                session.disconnect().await;
+                println!("已取消");
+                return Ok(());
+            }
+            let result = df_core::pairing::near::near_confirm(&mut session, &hs).await;
+            session.disconnect().await;
+            let pr = result?;
+            let trust = df_core::stores::Trust::from_pair_result(&pr);
+            dfabric::secrets::protect_trust(&trust);
+            store.upsert_trust(trust.clone())?;
+            df_core::logging::info(
+                "pair",
+                format!("附近配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]),
+            );
+            println!("配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]);
             return Ok(());
         }
-        let pr = df_core::pairing::near::near_confirm(&mut session, &hs).await?;
-        let trust = df_core::stores::Trust::from_pair_result(&pr);
-        dfabric::secrets::protect_trust(&trust);
-        store.upsert_trust(trust.clone())?;
-        df_core::logging::info(
-            "pair",
-            format!("附近配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]),
-        );
-        println!("配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]);
-        return Ok(());
+        Err(DfError::Pairing("没有设备处于配对窗口".into()))
+    })().await;
+    if !stopped {
+        scan_handle.stop().await;
     }
-    Err(DfError::Pairing("没有设备处于配对窗口".into()))
+    result
 }
 
 async fn pair_token(json: &str) -> Result<()> {

@@ -66,12 +66,26 @@ pub fn safe_filename(name: &str) -> String {
     if s.is_empty() || s == "." || s == ".." {
         s = "file".to_string();
     }
-    // 文件名 1..128 字符（协议约束），本地再保守一点
-    s = truncate_display_name(&s);
-    if s.is_empty() {
-        s = "file".to_string();
+    // 协议文件名可达 128 字符，常见文件系统单个名字上限 255 字节（UTF-8）；
+    // 留出 " (n)" 去重后缀的余量。超长时截短主名、保留扩展名（不能套用 64 码元的显示名称规则）。
+    truncate_filename(&s, 200)
+}
+
+/// 截短到 ≤ `max_bytes` 个 UTF-8 字节：保留不超过 16 字节的扩展名，不拆字符。
+fn truncate_filename(name: &str, max_bytes: usize) -> String {
+    if name.len() <= max_bytes {
+        return name.to_string();
     }
-    s
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= 16 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    let budget = max_bytes - ext.len();
+    let mut cut = budget.min(stem.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{ext}", &stem[..cut])
 }
 
 /// 不覆盖已有文件：存在则插入 ` (n)`。
@@ -118,6 +132,12 @@ mod tests {
         assert_eq!(safe_filename(".."), "file");
         assert_eq!(safe_filename(""), "file");
         assert!(!safe_filename("a\u{1}b").contains('\u{1}'));
+        // Lineage 发来的文件名常带 36 字符 UUID 前缀：超过 64 字符也必须原样保留扩展名
+        let long = "d7db9d06-9c41-47d9-b7be-de2bca88c7b3-20260922_155558_linux_log.zip";
+        assert_eq!(safe_filename(long), long);
+        let huge = format!("{}.tar.gz", "名".repeat(100));
+        let cut = safe_filename(&huge);
+        assert!(cut.len() <= 200 && cut.ends_with(".gz"));
     }
 
     #[cfg(target_os = "windows")]

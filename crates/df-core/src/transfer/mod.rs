@@ -44,44 +44,66 @@ impl DataConn {
     }
 
     /// 读取下一个数据事件（JSON 帧或 44 字节块头的二进制块帧）。
+    ///
+    /// 数据连接上两种帧并存，编码不同：
+    /// * JSON 帧（DATA_READY / CHUNK_ACK / COMPLETE / ERROR）：`uint32 BE 长度 + JSON`
+    ///   （节点用 `Wire.write`，带长度前缀）；
+    /// * 二进制块帧（下载方向，节点 `DataOutputStream` 直接写，**无长度前缀**）：
+    ///   `uint64 BE index | uint32 BE len | 32B SHA-256 | 数据`。
+    ///
+    /// 区分方法：JSON 帧载荷以 `{` 开头，即第 5 字节为 `{` 且首 4 字节是合法长度
+    /// （1..=65536）；块帧第 5 字节是 8 字节 index 的第 4 字节，块数上限 16384
+    /// （16 GiB / 1 MiB）下恒为 0x00，两者无歧义。
     pub async fn next_event(&mut self) -> Result<DataEvent> {
-        match crate::frame::read_frame(&mut self.stream).await? {
-            None => Ok(DataEvent::Closed),
-            Some(payload) => {
-                if payload.first() == Some(&b'{') {
-                    let env = Envelope::parse(&payload)?;
-                    return match env.kind.as_str() {
-                        "DATA_READY" => Ok(DataEvent::Ready),
-                        "CHUNK_ACK" => Ok(DataEvent::Ack {
-                            chunk_index: crate::fields::need_u64(&env.body, &["chunkIndex"], "chunkIndex")?,
-                            received: crate::fields::get_u64(&env.body, &["received"]),
-                        }),
-                        "COMPLETE" => Ok(DataEvent::Complete(env.body)),
-                        "ERROR" => Ok(DataEvent::Error(crate::msg::ErrorBody::from_value(&env.body)?)),
-                        other => Err(crate::session::ControlSession::unexpected(other, "数据帧")),
-                    };
-                }
-                // 二进制块帧：uint64 BE index | uint32 BE len | 32 字节块 SHA-256 | 数据
-                if payload.len() < 44 {
-                    return Err(DfError::Protocol(format!("块帧过短: {}", payload.len())));
-                }
-                let index = u64::from_be_bytes(payload[0..8].try_into().unwrap());
-                let len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
-                let hash: [u8; 32] = payload[12..44].try_into().unwrap();
-                let data = &payload[44..];
-                if data.len() != len {
-                    return Err(DfError::Protocol(format!(
-                        "块帧长度不一致: 声明 {len}, 实际 {}",
-                        data.len()
-                    )));
-                }
-                let actual = crate::crypto::sha256(data);
-                if actual != hash {
-                    return Err(DfError::Protocol(format!("块 {index} 哈希校验失败")));
-                }
-                Ok(DataEvent::Chunk { index, data: data.to_vec() })
-            }
+        let mut head = [0u8; 4];
+        match self.stream.read_exact(&mut head).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(DataEvent::Closed),
+            Err(e) => return Err(e.into()),
         }
+        let mut fifth = [0u8; 1];
+        self.stream.read_exact(&mut fifth).await?;
+        let declared = u32::from_be_bytes(head) as usize;
+
+        if fifth[0] == b'{' && (1..=crate::consts::MAX_FRAME).contains(&declared) {
+            // 长度前缀 JSON 帧（fifth 是载荷首字节）
+            let mut payload = vec![0u8; declared];
+            payload[0] = b'{';
+            self.stream.read_exact(&mut payload[1..]).await?;
+            let env = Envelope::parse(&payload)?;
+            return match env.kind.as_str() {
+                "DATA_READY" => Ok(DataEvent::Ready),
+                "CHUNK_ACK" => Ok(DataEvent::Ack {
+                    chunk_index: crate::fields::need_u64(&env.body, &["chunkIndex"], "chunkIndex")?,
+                    received: crate::fields::get_u64(&env.body, &["received"]),
+                }),
+                "COMPLETE" => Ok(DataEvent::Complete(env.body)),
+                "ERROR" => Ok(DataEvent::Error(crate::msg::ErrorBody::from_value(&env.body)?)),
+                other => Err(crate::session::ControlSession::unexpected(other, "数据帧")),
+            };
+        }
+
+        // 二进制块帧：head(4) + fifth(1) 是 8 字节 index 的前 5 字节
+        let mut idx = [0u8; 8];
+        idx[..4].copy_from_slice(&head);
+        idx[4] = fifth[0];
+        let mut rest = [0u8; 7];
+        self.stream.read_exact(&mut rest).await?;
+        idx[5..].copy_from_slice(&rest[..3]);
+        let index = u64::from_be_bytes(idx);
+        let len = u32::from_be_bytes(rest[3..7].try_into().unwrap()) as usize;
+        if len == 0 || len > crate::consts::CHUNK_SIZE as usize {
+            return Err(DfError::Protocol(format!("块帧长度越界: {len}")));
+        }
+        let mut hash = [0u8; 32];
+        self.stream.read_exact(&mut hash).await?;
+        let mut data = vec![0u8; len];
+        self.stream.read_exact(&mut data).await?;
+        let actual = crate::crypto::sha256(&data);
+        if actual != hash {
+            return Err(DfError::Protocol(format!("块 {index} 哈希校验失败")));
+        }
+        Ok(DataEvent::Chunk { index, data })
     }
 
     /// 发送块帧（头 44 字节 + 数据）。
