@@ -30,9 +30,11 @@ impl MdnsBrowser {
             .map_err(|e| DfError::Protocol(format!("浏览 {MDNS_SERVICE} 失败: {e}")))?;
         let candidates = self.candidates.clone();
         tokio::task::spawn_blocking(move || {
+            df_core::logging::info("mdns", format!("开始浏览 {MDNS_SERVICE}"));
             while let Ok(event) = receiver.recv() {
                 if let ServiceEvent::ServiceResolved(info) = event {
                     for ip in info.get_addresses() {
+                        df_core::logging::debug("mdns", format!("候选地址 {ip}（{}）", info.get_fullname()));
                         if let Ok(mut m) = candidates.try_write() {
                             m.insert(*ip, Instant::now());
                         }

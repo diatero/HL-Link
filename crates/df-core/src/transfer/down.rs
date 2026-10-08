@@ -188,10 +188,7 @@ pub async fn pull_accept(
                 file.seek(std::io::SeekFrom::Start(index * meta.chunk_size)).await?;
                 file.write_all(&chunk).await?;
                 file.flush().await?;
-                {
-                    use std::os::unix::io::AsRawFd;
-                    fsutil::sync_raw_fd(file.as_raw_fd())?;
-                }
+                sync_staging(&file).await?;
                 // 原子保存位图日志，然后才 ACK
                 done.insert(index);
                 if let Some(j) = journal.as_mut() {
@@ -252,6 +249,23 @@ pub async fn pull_accept(
         return Err(ControlSession::unexpected(&env.kind, "PULL_COMPLETED"));
     }
     Ok(())
+}
+
+/// 暂存块落盘：unix 走 fsync（macOS F_FULLFSYNC），Windows 走 `sync_all`。
+/// 必须先把 `std::os::unix` 隔在这里，否则非 unix 目标无法编译。
+#[allow(unused_variables)]
+async fn sync_staging(file: &tokio::fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        fsutil::sync_raw_fd(file.as_raw_fd())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all().await?;
+        Ok(())
+    }
 }
 
 /// 生成收件位置（不覆盖已有文件）。

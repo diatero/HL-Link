@@ -1,6 +1,9 @@
 # Device Fabric 桌面端（Linux / macOS / Windows）开发说明
 
-日期：2026-10-07。状态：**桌面端尚未实现**，本文是开发前的技术说明，不是验证记录。
+日期：2026-10-07（2026-10-08 补注）。状态：**桌面端已实现**（Rust，`/home/diater/CodeBuddy/HL Link-linux`），
+本文保留为开发依据；2026-10-08 修复了 4 处导致配对失败协议缺陷，但**仍未与真机联调**，
+所以本文不是验证记录。实现侧新增能力：文件日志（分级/轮转/0600）、`dfctl selftest` 自检、
+macOS 打包权限声明（蓝牙/本地网络）。
 配套文档：[LineageOS 实施方案](device-fabric.md)、[HarmonyOS 适配说明](device-fabric-harmonyos-adaptation.md)、
 [自定义设备名称](device-fabric-name.md)。
 

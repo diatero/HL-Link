@@ -41,16 +41,30 @@ impl NearHandshake {
     }
 }
 
+/// DF-NEAR-1 客户端揭示串 C（无结尾换行）。
+/// 提交给节点的是 `base64(SHA256(C))`。
+///
+/// `DF-NEAR-C1\n<eid>\n<客户端 ECDH 公钥 SPKI base64>\n<nonce>\n<证书公钥 SPKI base64>\n<base64(UTF8(名称))>`
+pub fn client_commit_string(eid: &str, ecdh_spki_b64: &str, nonce_b64: &str, cert_spki_b64: &str, name_b64: &str) -> String {
+    format!("DF-NEAR-C1\n{eid}\n{ecdh_spki_b64}\n{nonce_b64}\n{cert_spki_b64}\n{name_b64}")
+}
+
+/// DF-NEAR-1 服务端揭示串 S 的格式（节点侧生成；这里供自检对拍字段数与顺序）。
+///
+/// `DF-NEAR-S1\n<eid>\n<节点 ECDH 公钥 SPKI base64>\n<节点 nonce base64>\n<nodeId>\n<CA DER base64>`
+pub fn server_commit_string(eid: &str, node_spki_b64: &str, node_nonce_b64: &str, node_id: &str, ca_der_b64: &str) -> String {
+    format!("DF-NEAR-S1\n{eid}\n{node_spki_b64}\n{node_nonce_b64}\n{node_id}\n{ca_der_b64}")
+}
+
 /// 第一阶段：commit + reveal。返回握手状态与 SAS 验证码。
+///
+/// `eid` 必须来自刚读到的 INFO 特征值（`parse_info`），不能从消息流里等：
+/// DF-NEAR-1 由 Controller 先发 `NEAR_COMMIT`，节点在收到之前不会主动推送任何消息，
+/// 在这里 recv 会一直阻塞到节点 60 秒空闲清理断开连接。
+///
 /// 调用方展示验证码；用户确认一致后调用 [`near_confirm`]，取消则调用 [`near_cancel`]。
-pub async fn near_prepare(link: &mut dyn GattLink, display_name: &str) -> Result<NearHandshake> {
-    // INFO 已由调用方读取（eid、pairing 必须为 true）
-    let eid = {
-        let raw = link.recv_message().await?;
-        let v: serde_json::Value = serde_json::from_slice(&raw)
-            .map_err(|e| DfError::Protocol(format!("首条消息不是 JSON: {e}")))?;
-        fields::need_str(&v, &["eid"], "eid")?
-    };
+pub async fn near_prepare(link: &mut dyn GattLink, eid: &str, display_name: &str) -> Result<NearHandshake> {
+    let eid = eid.to_string();
 
     let ecdh = keys::new_ecdh_secret();
     let identity = SigningIdentity::generate();
@@ -59,9 +73,7 @@ pub async fn near_prepare(link: &mut dyn GattLink, display_name: &str) -> Result
     let ecdh_spki_b64 = b64_encode(&keys::p256_spki(&keys::ecdh_public_key(&ecdh)));
     let cert_spki_b64 = b64_encode(&identity.spki_der());
 
-    let c_str = format!(
-        "DF-NEAR-C1\n{eid}\n{ecdh_spki_b64}\n{nonce}\n{cert_spki_b64}\n{name_b64}"
-    );
+    let c_str = client_commit_string(&eid, &ecdh_spki_b64, &nonce, &cert_spki_b64, &name_b64);
     let commit = b64_encode(&sha256(c_str.as_bytes()));
 
     let msg = serde_json::to_vec(&serde_json::json!({
@@ -69,6 +81,7 @@ pub async fn near_prepare(link: &mut dyn GattLink, display_name: &str) -> Result
         "eid": eid,
         "commit": commit,
     }))?;
+    crate::logging::info("near", &format!("NEAR_COMMIT 已发送（eid {eid}）"));
     link.send_message(&msg).await?;
 
     let (_, v) = expect_type(link, &["NEAR_COMMIT"], Duration::from_secs(15)).await?;

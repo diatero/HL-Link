@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 打包时由 tauri-build 合并进 .app/Contents/Info.plist。
+
+  这两类权限缺一不可：
+  - 蓝牙：CoreBluetooth 在未声明用途说明时直接返回「未授权」，btleplug 拿不到适配器，
+    附近配对与 BLE 建链全部不可用（自检里的「蓝牙适配器」会给出提示）。
+  - 本地网络 + Bonjour：macOS 14+ 需要显式声明才能收发 mDNS 组播，否则发现不到节点
+    （不影响用上次地址/手工输入地址连接）。
+-->
+<plist version="1.0">
+<dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>DeviceFabric 使用蓝牙与你的手机配对，并在没有路由器时建立直连。</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>DeviceFabric 使用蓝牙与你的手机设备配对。</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>DeviceFabric 需要在本地网络中查找并连接你已配对的手机，以传输文件。</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_dfabric._tcp</string>
+  </array>
+</dict>
+</plist>

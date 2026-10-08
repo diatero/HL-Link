@@ -2,7 +2,10 @@
 //!
 //! 平台实现：
 //! - Linux：NetworkManager（nmcli）临时连接（不自动连接、结束后删除并恢复原网络）；
-//! - macOS / Windows：v1 未实现（需 CoreWLAN / Native Wifi 适配），界面说明原因。
+//! - macOS：v1 未实现。CoreWLAN 公开 API 只支持以 BSSID/SSID+口令加入**基础设施网络**，
+//!   而 Wi-Fi Direct GO 需要系统在 scan/assoc 层识别 P2P IE，`networksetup -setairportnetwork`
+//!   同样会失败；不做“看起来成功其实没连上”的假实现。请改用局域网或手机热点。
+//! - Windows：v1 未实现（需要 WlanSetProfile + GO 关联，同样受 P2P IE 限制）。
 //!
 //! 安全要求：入组前必须征得用户同意；使用 BLE 认证通道拿到的 SSID/口令；
 //! 传输结束、取消或失败后删除临时配置并恢复原网络；不长期保存组口令。
@@ -25,9 +28,17 @@ pub struct PrevState {
 pub async fn join_go(join: &GoJoin) -> Result<PrevState> {
     #[cfg(target_os = "linux")]
     {
+        df_core::logging::info("wifi", format!("加入 GO：{}（临时连接，结束后恢复原网络）", join.ssid));
         linux_join(join).await
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = join;
+        Err(DfError::Unsupported(
+            "macOS 暂不支持以普通客户端加入 Wi-Fi Direct GO（CoreWLAN 无法关联 P2P 组）；请改用局域网，或由手机开热点".into(),
+        ))
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     {
         let _ = join;
         Err(DfError::Unsupported(

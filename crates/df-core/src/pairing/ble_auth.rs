@@ -27,7 +27,11 @@ pub fn hint_for(ble_key: &[u8; 32], eid: &str) -> String {
     hex::encode(mac)[..32].to_string()
 }
 
-fn t_string(node_id: &str, eid: &str, cn: &str, sn: &str) -> String {
+/// DF-BLE-1 转录串 T（无结尾换行）：
+/// `DF-BLE-1\n<nodeId>\n<eid>\n<cn base64>\n<sn base64>`。
+/// 服务端证明是 `HMAC(key, T + "\nserver")`，客户端是 `+ "\nclient"`，会话 ID 是 `+ "\nsession"`，
+/// 三者都按标准 base64 传输。
+pub fn transcript(node_id: &str, eid: &str, cn: &str, sn: &str) -> String {
     format!("DF-BLE-1\n{node_id}\n{eid}\n{cn}\n{sn}")
 }
 
@@ -137,16 +141,16 @@ pub async fn authenticate(
     debug_assert_eq!(t, "CHALLENGE");
     let sn = fields::need_str(&v, &["sn"], "sn")?;
     let proof = fields::need_str(&v, &["proof"], "proof")?;
-    let tstr = t_string(node_id, eid, &cn, &sn);
-    let expect_server = hex::encode(hmac_sha256(ble_key, format!("{tstr}\nserver").as_bytes()));
-    // 常量时间比较由 HMAC 输出等长 + 字符串比较实现（hex 展开前后均无秘密常量）
-    if !eq_ignore_case(&proof, &expect_server) {
+    let tstr = transcript(node_id, eid, &cn, &sn);
+    let expect_server = hmac_sha256(ble_key, format!("{tstr}\nserver").as_bytes());
+    // 协议（DF1.md §BLE 认证与节点 Wire.b64）用标准 base64 传输 MAC
+    if !verify_mac(&expect_server, &proof) {
         return Err(DfError::Ble("CHALLENGE proof 校验失败：对方不是该节点".into()));
     }
 
     let msg = serde_json::to_vec(&serde_json::json!({
         "type": "AUTH_FINISH",
-        "proof": hex::encode(hmac_sha256(ble_key, format!("{tstr}\nclient").as_bytes())),
+        "proof": encode_mac(&hmac_sha256(ble_key, format!("{tstr}\nclient").as_bytes())),
     }))?;
     link.send_message(&msg).await?;
 
@@ -154,8 +158,8 @@ pub async fn authenticate(
     let (t, v) = super::expect_type(link, &["AUTH_OK"], Duration::from_secs(10)).await?;
     debug_assert_eq!(t, "AUTH_OK");
     let session_id = fields::need_str(&v, &["sessionId"], "sessionId")?;
-    let expect_session = hex::encode(hmac_sha256(ble_key, format!("{tstr}\nsession").as_bytes()));
-    if !eq_ignore_case(&session_id, &expect_session) {
+    let expect_session = hmac_sha256(ble_key, format!("{tstr}\nsession").as_bytes());
+    if !verify_mac(&expect_session, &session_id) {
         return Err(DfError::Ble("AUTH_OK sessionId 校验失败".into()));
     }
 
@@ -164,8 +168,36 @@ pub async fn authenticate(
     Ok(ch)
 }
 
-fn eq_ignore_case(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+/// 发送方向的 MAC 编码：标准 base64（与节点 `Wire.b64` 一致）。
+pub fn encode_mac(mac: &[u8; 32]) -> String {
+    b64_encode(mac)
+}
+
+/// 校验节点返回的 MAC。协议规定 base64；为便于与历史实现/手工对拍，同时接受
+/// 64 位 hex。两种表示都必须解码成正好 32 字节，再常量时间比较。
+pub fn verify_mac(expected: &[u8; 32], provided: &str) -> bool {
+    match decode_mac(provided) {
+        Some(raw) => raw.len() == expected.len() && ct_eq(&raw, expected),
+        None => false,
+    }
+}
+
+fn decode_mac(s: &str) -> Option<Vec<u8>> {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return hex::decode(s).ok();
+    }
+    b64_decode(s).ok()
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// LINK_REQUEST(LAN)：取节点当前地址。

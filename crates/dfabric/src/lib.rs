@@ -5,8 +5,10 @@
 
 pub mod agent;
 pub mod ble;
+pub mod logging;
 pub mod mdns;
 pub mod secrets;
+pub mod selfcheck;
 pub mod wifi;
 
 use df_core::error::{DfError, Result};
@@ -139,8 +141,13 @@ pub async fn connect_trust(
     let config = df_core::tls::client_config(&trust.ca_pem, &trust.cert_pem, &trust.key_pem)?;
     let candidates = lan_candidates(mdns, trust).await;
     if candidates.is_empty() {
+        df_core::logging::warn(
+            "connect",
+            format!("设备 {}… 没有可用候选地址（mDNS 未发现且无上次地址）", &trust.node_id[..12.min(trust.node_id.len())]),
+        );
         return Err(DfError::NotConnected);
     }
+    df_core::logging::debug("connect", format!("候选地址 {candidates:?}"));
     let mut last_err = DfError::NotConnected;
     for ip in candidates {
         match df_core::session::ControlSession::connect(
@@ -182,6 +189,7 @@ pub fn display_name(store: &df_core::stores::Store) -> String {
 
 /// 平台通知（尽力而为）。
 pub fn notify(title: &str, body: &str) {
+    df_core::logging::info("notify", format!("{title}: {body}"));
     println!("[通知] {title}: {body}");
     #[cfg(target_os = "linux")]
     {

@@ -30,6 +30,22 @@ pub struct PairResult {
     pub data_port: u16,
 }
 
+/// 解析响应里的节点 CA 字段。
+///
+/// 同一语义在协议里有两种表示，必须都能接受：
+/// * 导出/二维码 JSON `caDer`：标准 base64 的 DER；
+/// * `PAIR_RESULT` / `NEAR_RESULT` 的 `nodeCa`：**PEM 文本**（节点 `Identity.pem()`），
+///   按 base64 解码会得到 `Invalid symbol 45`（`-`）。这是曾经导致两条配对路径
+///   全部失败的缺陷点。
+pub fn parse_ca_field(v: &serde_json::Value) -> Result<Vec<u8>> {
+    let raw = fields::need_str(v, &["caDer", "nodeCa", "ca"], "caDer/nodeCa")?;
+    if raw.contains("-----BEGIN") {
+        keys::pem_to_der(&raw)
+    } else {
+        crate::crypto::b64_decode(&raw)
+    }
+}
+
 /// 解析并校验配对结果 JSON（第 7.1.6 / 7.2 节的校验不可省略）。
 ///
 /// * `expected_ca_der`：附近配对时为 S 中拿到的 CA（必须一致）；导入配对时为 None。
@@ -40,8 +56,7 @@ pub fn parse_pair_result(
     identity: &SigningIdentity,
 ) -> Result<PairResult> {
     let node_id = fields::need_str(v, &["nodeId"], "nodeId")?;
-    let ca_b64 = fields::need_str(v, &["caDer", "nodeCa", "ca"], "caDer")?;
-    let ca_der = crate::crypto::b64_decode(&ca_b64)?;
+    let ca_der = parse_ca_field(v)?;
 
     // nodeId 必须等于 CA SPKI 的 SHA-256
     let derived = keys::node_id_from_ca_der(&ca_der)?;
@@ -65,6 +80,16 @@ pub fn parse_pair_result(
     let cert_spki = keys::cert_spki_der(&cert_der)?;
     if cert_spki != identity.spki_der() {
         return Err(DfError::Pairing("客户端证书公钥与提交的公钥不一致".into()));
+    }
+
+    // peerId 必须等于客户端证书 DER 的 SHA-256（节点回执里给了就核对）
+    let derived_peer = peer_id_from_cert_der(&cert_der);
+    if let Some(given) = fields::get_str(v, &["peerId"]) {
+        if !given.is_empty() && !given.eq_ignore_ascii_case(&derived_peer) {
+            return Err(DfError::Pairing(format!(
+                "peerId 与客户端证书不一致: {given} != {derived_peer}"
+            )));
+        }
     }
 
     let ble_key = match fields::get_str(v, &["bleKey", "bleKeyB64"]) {

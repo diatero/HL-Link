@@ -5,6 +5,10 @@
 //! - 以 service UUID 过滤；INFO 中的 eid 为准（扫描看到的可能已轮换）；
 //! - 先订阅 TX（notify），再读 INFO，再写 RX；
 //! - 写入按 MTU 切片（保守按 ATT MTU 23 → payload 14），避免平台自动 long write 被节点拒绝。
+//!
+//! 平台差异：Linux 用 BlueZ（需 bluetoothd）、macOS 用 CoreBluetooth（**必须有
+//! `NSBluetoothAlwaysUsageDescription`，否则进程拿不到适配器**）、Windows 用 WinRT。
+//! macOS 上适配器信息与广播地址由系统再映射一次，均不可当身份使用。
 
 use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
@@ -33,14 +37,30 @@ pub async fn device_label(peripheral: &Peripheral) -> String {
         .unwrap_or_else(|| "附近的 Lineage 设备".into())
 }
 
-/// 扫描发现（有超时，找到即返回；桌面端不要常驻扫描）。
-pub async fn scan(timeout: Duration) -> Result<Vec<Peripheral>> {
+/// 取第一个可用适配器（macOS 走 CoreBluetooth，Linux 走 BlueZ）。
+async fn first_adapter() -> Result<Adapter> {
     let manager = Manager::new().await.map_err(|e| DfError::Ble(format!("BLE 管理器: {e}")))?;
     let adapters = manager.adapters().await.map_err(|e| DfError::Ble(format!("获取适配器: {e}")))?;
-    let adapter: Adapter = adapters
+    adapters
         .into_iter()
         .next()
-        .ok_or_else(|| DfError::Ble("没有可用的蓝牙适配器".into()))?;
+        .ok_or_else(|| DfError::Ble("没有可用的蓝牙适配器".into()))
+}
+
+/// 适配器可用性（自检用：不扫描、不连接、不申请额外权限）。
+pub async fn adapter_available() -> Result<String> {
+    let adapter = first_adapter().await?;
+    let info = adapter
+        .adapter_info()
+        .await
+        .unwrap_or_else(|_| "蓝牙适配器".into());
+    Ok(format!("{info}（BLE 中心设备就绪）"))
+}
+
+/// 扫描发现（有超时，找到即返回；桌面端不要常驻扫描）。
+pub async fn scan(timeout: Duration) -> Result<Vec<Peripheral>> {
+    let adapter: Adapter = first_adapter().await?;
+    df_core::logging::debug("ble", format!("开始扫描 _dfabric 服务（{timeout:?}）"));
 
     adapter
         .start_scan(ScanFilter { services: vec![service_uuid()] })
@@ -66,6 +86,7 @@ pub async fn scan(timeout: Duration) -> Result<Vec<Peripheral>> {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     let _ = adapter.stop_scan().await;
+    df_core::logging::info("ble", format!("扫描结束：{} 个候选设备", found.len()));
     Ok(found)
 }
 
@@ -125,6 +146,10 @@ impl BleSession {
             .await
             .map_err(|e| DfError::Ble(format!("读 INFO: {e}")))?;
         let (eid, pairing) = df_core::pairing::near::parse_info(&info_bytes)?;
+        df_core::logging::info(
+            "ble",
+            format!("GATT 就绪：eid {eid}，添加设备窗口 {}（此 eid 用于 DF-NEAR-1 与 DF-BLE-1，不要从消息流里等）", if pairing { "开启" } else { "关闭" }),
+        );
 
         let mtu = detect_mtu(&peripheral).await;
         Ok((

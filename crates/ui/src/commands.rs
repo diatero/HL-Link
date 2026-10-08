@@ -273,7 +273,7 @@ pub async fn pair_near_start(
         .map_err(err_to_string)?;
     for p in found {
         let label = dfabric::ble::device_label(&p).await;
-        let (mut session, _eid, pairing) = match BleSession::connect(p).await {
+        let (mut session, eid, pairing) = match BleSession::connect(p).await {
             Ok(x) => x,
             Err(_) => continue,
         };
@@ -282,9 +282,15 @@ pub async fn pair_near_start(
         }
         let store = dfabric::open_store().map_err(err_to_string)?;
         let name = dfabric::display_name(&store);
-        let hs = df_core::pairing::near::near_prepare(&mut session, &name)
-            .await
-            .map_err(err_to_string)?;
+        // eid 取自 INFO；DF-NEAR-1 必须由本端先发 NEAR_COMMIT，这里再等节点说话会一直等到
+        // 节点判空闲断开（约 60 秒）。加超时保证命令不会无限挂起。
+        let hs = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            df_core::pairing::near::near_prepare(&mut session, &eid, &name),
+        )
+        .await
+        .map_err(|_| "附近配对握手超时（请确认手机仍停在「添加设备」窗口）".to_string())?
+        .map_err(err_to_string)?;
         let sas = hs.sas();
         let node_id = hs.node_id().to_string();
         *state.handshake.lock().await = Some(hs);
@@ -336,4 +342,79 @@ pub async fn daemon_running() -> bool {
 #[tauri::command]
 pub async fn read_pairing_file(path: String) -> std::result::Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))
+}
+
+// —— 诊断：自检与日志 ——
+
+/// 运行自检（只读，不修改任何数据）。返回检查项列表与统计。
+#[tauri::command]
+pub async fn run_selftest(
+    no_ble: bool,
+    no_mdns: bool,
+    connect: bool,
+) -> std::result::Result<serde_json::Value, String> {
+    let opts = dfabric::selfcheck::Options {
+        ble: !no_ble,
+        mdns: !no_mdns,
+        connect,
+        timeout: std::time::Duration::from_secs(6),
+    };
+    df_core::logging::info("selftest", format!("GUI 触发自检（{opts:?}）"));
+    let checks = dfabric::selfcheck::run(&opts).await;
+    let (pass, warn, fail, skip) = dfabric::selfcheck::summary(&checks);
+    Ok(serde_json::json!({
+        "checks": checks,
+        "pass": pass,
+        "warn": warn,
+        "fail": fail,
+        "skip": skip,
+    }))
+}
+
+/// 日志与数据目录位置。
+#[tauri::command]
+pub async fn log_info() -> std::result::Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "path": df_core::logging::log_path().map(|p| p.display().to_string()),
+        "dir": dfabric::logging::log_dir().display().to_string(),
+        "dataDir": dfabric::data_dir().display().to_string(),
+    }))
+}
+
+/// 最近日志（含轮转文件）。
+#[tauri::command]
+pub async fn read_logs(tail: usize) -> std::result::Result<String, String> {
+    let lines = df_core::logging::recent(tail.clamp(1, 2000));
+    if lines.is_empty() {
+        return Ok("（暂无日志内容）".into());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// 用系统文件管理器打开日志目录。
+#[tauri::command]
+pub async fn open_log_dir() -> std::result::Result<(), String> {
+    let dir = dfabric::logging::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建日志目录: {e}"))?;
+    let target = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&target);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(&target);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(&target);
+        c
+    };
+    cmd.spawn().map_err(|e| format!("无法打开日志目录: {e}"))?;
+    Ok(())
 }

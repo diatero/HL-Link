@@ -245,6 +245,55 @@ $("#btn-reset-name").addEventListener("click", async () => {
   toast("已恢复跟随系统名称");
 });
 
+// —— 诊断：自检与日志 ——
+const statusClass = (s) =>
+  s === "fail" ? "failed" : s === "warn" ? "pending" : s === "skip" ? "cancelled" : "completed";
+
+$("#btn-selftest").addEventListener("click", async () => {
+  const btn = $("#btn-selftest");
+  btn.disabled = true;
+  $("#diag-summary").textContent = "正在自检…（连接测试最多等待数秒）";
+  try {
+    const r = await invoke("run_selftest", {
+      noBle: !$("#diag-ble").checked,
+      noMdns: !$("#diag-mdns").checked,
+      connect: $("#diag-connect").checked,
+    });
+    $("#diag-summary").textContent = `PASS ${r.pass} / WARN ${r.warn} / FAIL ${r.fail} / SKIP ${r.skip}` +
+      (r.fail > 0 ? "　—　存在 FAIL，请按提示处理后重试" : "");
+    $("#diag-result").innerHTML = r.checks
+      .map(
+        (c) => `
+      <div class="card">
+        <div class="info">
+          <div class="title">${escapeHtml(c.name)}</div>
+          <div class="sub">${escapeHtml(c.detail)}</div>
+        </div>
+        <span class="state ${statusClass(c.status)}">${c.status.toUpperCase()}</span>
+      </div>`
+      )
+      .join("");
+  } catch (e) {
+    toast(`自检失败: ${e}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function refreshLogs() {
+  const info = await invoke("log_info");
+  $("#log-path").textContent =
+    `日志文件: ${info.path || "（未初始化）"}　目录: ${info.dir}　数据目录: ${info.dataDir}`;
+  $("#log-view").textContent = await invoke("read_logs", { tail: 200 });
+}
+
+$("#btn-refresh-logs").addEventListener("click", () =>
+  safe("读取日志失败", refreshLogs)
+);
+$("#btn-open-log-dir").addEventListener("click", () =>
+  safe("打开日志目录失败", () => invoke("open_log_dir"))
+);
+
 // —— 轮询与初始化 ——
 async function tick() {
   try {
@@ -264,3 +313,9 @@ invoke("get_name").then((r) => {
   $("#name-input").value = r.custom ? r.name : "";
   $("#name-input").placeholder = `跟随系统名称（${r.name}）`;
 });
+invoke("log_info")
+  .then((info) => {
+    $("#log-path").textContent =
+      `日志文件: ${info.path || "（未初始化）"}　目录: ${info.dir}　数据目录: ${info.dataDir}`;
+  })
+  .catch(() => {});

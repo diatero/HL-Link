@@ -122,11 +122,18 @@ pub fn der_to_pem(der: &[u8], label: &str) -> String {
 }
 
 /// PEM（单块）→ DER。
+///
+/// 节点用 `Base64.getMimeEncoder(64, {'\n'})` 生成 PEM，但跨平台文本处理可能引入
+/// CRLF；这里对每行先 trim 再过滤 PEM 边界行，并把 base64 里不允许的空白剔除。
 pub fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     let body: String = pem
         .lines()
-        .filter(|l| !l.starts_with("-----"))
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
         .collect();
+    if body.is_empty() {
+        return Err(DfError::Protocol("PEM 中没有证书内容".into()));
+    }
     crate::crypto::b64_decode(&body)
 }
 

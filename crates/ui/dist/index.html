@@ -18,6 +18,7 @@
       <button class="tab" data-tab="pulls">接收 <span id="pull-count" class="count hidden">0</span></button>
       <button class="tab" data-tab="sends">发送</button>
       <button class="tab" data-tab="settings">设置</button>
+      <button class="tab" data-tab="diag">诊断</button>
     </nav>
   </header>
 
@@ -70,6 +71,27 @@
         <button id="btn-reset-name">恢复跟随系统</button>
       </div>
       <p class="hint">名称会在每次已鉴权连接时同步到手机；清空即恢复跟随系统名称。</p>
+    </section>
+
+    <!-- 诊断 -->
+    <section id="tab-diag" class="panel">
+      <h3>自检</h3>
+      <div class="row">
+        <button id="btn-selftest" class="primary">运行自检</button>
+        <label class="check"><input type="checkbox" id="diag-ble" checked /> 蓝牙</label>
+        <label class="check"><input type="checkbox" id="diag-mdns" checked /> mDNS</label>
+        <label class="check"><input type="checkbox" id="diag-connect" /> 连接测试（需手机在线）</label>
+      </div>
+      <p id="diag-summary" class="hint">自检只读取本机状态与已配对信息，不会修改任何数据。</p>
+      <div id="diag-result" class="cards"></div>
+
+      <h3>日志</h3>
+      <div class="row">
+        <button id="btn-refresh-logs">刷新日志</button>
+        <button id="btn-open-log-dir">打开日志目录</button>
+      </div>
+      <p id="log-path" class="hint"></p>
+      <pre id="log-view" class="logview">（点击「刷新日志」查看最近 200 行）</pre>
     </section>
   </main>
 

@@ -55,6 +55,11 @@ pub fn pairing_config(ca_pem: &str) -> Result<Arc<ClientConfig>> {
     for c in parse_certs(ca_pem)? {
         roots.add(c).map_err(|e| DfError::Tls(e.to_string()))?;
     }
+    // rustls 在信任锚为空时会在 with_root_certificates 内部直接 panic；
+    // 任何解析失败都必须变成普通错误，绝不让进程崩溃。
+    if roots.is_empty() {
+        return Err(DfError::Tls("信任锚为空：配对信息里的 CA 无效".into()));
+    }
     let config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     Ok(Arc::new(config))
 }
@@ -62,7 +67,7 @@ pub fn pairing_config(ca_pem: &str) -> Result<Arc<ClientConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{der_to_pem, SigningIdentity};
+    use crate::keys::SigningIdentity;
 
     fn self_signed_test_pem() -> (String, String, String) {
         // 仅测试配置构建路径：签名身份自签一张最小证书
@@ -79,5 +84,8 @@ mod tests {
         let (_c, _k, key) = self_signed_test_pem();
         assert!(client_config("", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", &key).is_err());
         assert!(client_config("not a pem", "", "").is_err());
+        // 空信任锚必须返回错误而不是 panic（rustls 会在 builder 内部 panic）
+        assert!(pairing_config("").is_err());
+        assert!(pairing_config("not a pem").is_err());
     }
 }

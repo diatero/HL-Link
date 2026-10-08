@@ -21,7 +21,16 @@ pub struct TokenPairing {
     pub pairing_token: String,
     pub expires_at_ms: u64,
     pub addresses: Vec<String>,
+    pub control_port: u16,
+    pub data_port: u16,
     pub group: Option<Value>,
+}
+
+/// PAIR 公钥持有证明的签名原文（无结尾换行）：
+/// `DF-PAIR-1\n<nodeId>\n<pairingToken>\n<HELLO_ACK.challenge>`。
+/// 节点用 `SHA256withECDSA` 校验同一串，字段顺序或换行不一致都会失败。
+pub fn pair_proof_message(node_id: &str, pairing_token: &str, challenge: &str) -> String {
+    format!("DF-PAIR-1\n{node_id}\n{pairing_token}\n{challenge}")
 }
 
 impl TokenPairing {
@@ -60,6 +69,10 @@ impl TokenPairing {
             pairing_token: fields::need_str(&v, &["pairingToken"], "pairingToken")?,
             expires_at_ms,
             addresses,
+            control_port: fields::get_u64(&v, &["controlPort"])
+                .unwrap_or(crate::consts::DEFAULT_CONTROL_PORT as u64) as u16,
+            data_port: fields::get_u64(&v, &["dataPort"])
+                .unwrap_or(crate::consts::DEFAULT_DATA_PORT as u64) as u16,
             group: v.get("group").cloned(),
         })
     }
@@ -86,7 +99,9 @@ impl TokenPairing {
     async fn pair_to(&self, ip: IpAddr, identity: &SigningIdentity, display_name: &str) -> Result<PairResult> {
         crate::tls::ensure_provider();
         let cfg = crate::tls::pairing_config(&self.ca_pem)?;
-        let mut session = ControlSession::connect(ip, crate::consts::DEFAULT_CONTROL_PORT, cfg, Duration::from_secs(5)).await?;
+        let port = if self.control_port == 0 { crate::consts::DEFAULT_CONTROL_PORT } else { self.control_port };
+        crate::logging::info("pair", &format!("PAIR：连接 {ip}:{port}"));
+        let mut session = ControlSession::connect(ip, port, cfg, Duration::from_secs(5)).await?;
 
         // 匿名 HELLO：不带 name
         let ack = session.hello("dfabric-desktop", None).await?;
@@ -98,7 +113,7 @@ impl TokenPairing {
         }
 
         // proof = ECDSA-SHA256(DER) over `DF-PAIR-1\n<nodeId>\n<pairingToken>\n<challenge>`
-        let msg = format!("DF-PAIR-1\n{}\n{}\n{}", self.node_id, self.pairing_token, ack.challenge);
+        let msg = pair_proof_message(&self.node_id, &self.pairing_token, &ack.challenge);
         let sig = identity.sign_der(msg.as_bytes());
 
         let env = session
@@ -119,6 +134,18 @@ impl TokenPairing {
         }
         let mut pr = super::parse_pair_result(&env.body, None, identity)?;
         pr.key_pem = identity.to_pkcs8_pem();
+        // PAIR_RESULT 不含 addresses/端口（只有 NEAR_RESULT 才有）；用导出信息回填，
+        // 否则首次连接会因为没有候选地址而失败（只能等 mDNS 重新发现）。
+        if pr.addresses.is_empty() {
+            pr.addresses = self.addresses.clone();
+        }
+        if pr.control_port == 0 {
+            pr.control_port = self.control_port;
+        }
+        if pr.data_port == 0 {
+            pr.data_port = self.data_port;
+        }
+        crate::logging::info("pair", &format!("PAIR 完成：peer {peer}", peer = &pr.peer_id[..12.min(pr.peer_id.len())]));
         Ok(pr)
     }
 }

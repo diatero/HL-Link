@@ -8,6 +8,19 @@ use tauri::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // GUI 与 Agent 共用同一份日志文件；GUI 也写日志，便于把界面操作与链路事件对齐。
+    df_core::tls::ensure_provider();
+    dfabric::logging::init_or_stderr(dfabric::logging::level_from_env(), false);
+    df_core::logging::info(
+        "ui",
+        format!(
+            "DeviceFabric GUI 启动（{}，日志 {}）",
+            std::env::consts::OS,
+            df_core::logging::log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "仅 stderr".into())
+        ),
+    );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -29,6 +42,10 @@ pub fn run() {
             commands::pair_near_cancel,
             commands::daemon_running,
             commands::read_pairing_file,
+            commands::run_selftest,
+            commands::log_info,
+            commands::read_logs,
+            commands::open_log_dir,
         ])
         .setup(|app| {
             // 托盘：显示主窗口 / 退出

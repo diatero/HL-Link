@@ -41,7 +41,11 @@ impl ControlSession {
         let stream = timeout(connect_timeout, connector.connect(server_name, tcp))
             .await
             .map_err(|_| DfError::Timeout("TLS 握手超时".into()))?
-            .map_err(|e| DfError::Tls(format!("TLS 握手失败: {e}")))?;
+            .map_err(|e| {
+                crate::logging::warn("tls", format!("{addr}:{control_port} TLS 握手失败: {e}"));
+                DfError::Tls(format!("TLS 握手失败: {e}"))
+            })?;
+        crate::logging::debug("tls", format!("{addr}:{control_port} TLS 握手完成（nid={:?}）", stream.get_ref().1.negotiated_cipher_suite().map(|c| c.suite())));
         Ok(ControlSession { stream, peer_addr: addr, control_port, data_port: None, hello_session_id: String::new() })
     }
 
@@ -89,9 +93,20 @@ impl ControlSession {
             .await
             .map_err(|_| DfError::Timeout("HELLO 超时".into()))??;
         if env.kind != "HELLO_ACK" {
+            crate::logging::warn("session", format!("HELLO 未得到 HELLO_ACK：{}", env.kind));
             return Err(DfError::Protocol(format!("期望 HELLO_ACK，收到 {}", env.kind)));
         }
         let ack = HelloAck::from_value(&env.body)?;
+        crate::logging::info(
+            "session",
+            format!(
+                "HELLO_ACK: node {}… 能力 [{}] chunkSize={} window={}",
+                &ack.node_id[..12.min(ack.node_id.len())],
+                ack.capabilities.join(","),
+                ack.chunk_size,
+                ack.window
+            ),
+        );
         self.hello_session_id = ack.session_id.clone();
         Ok(ack)
     }
@@ -137,8 +152,6 @@ impl ControlSession {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn server_name_from_ip() {
         // IP 形式的服务器名必须可构造（4.2 节）

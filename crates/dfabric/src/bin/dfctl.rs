@@ -2,14 +2,23 @@
 
 use clap::{Parser, Subcommand};
 use df_core::error::{DfError, Result};
-use df_core::pairing::ble_auth;
 use dfabric::agent::{self, IpcCommand, IpcReply};
+use dfabric::selfcheck;
 use std::io::Write as _;
 use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "dfctl", about = "DeviceFabric 桌面端命令行（Controller）", version)]
 struct Cli {
+    /// 日志级别：error / warn / info / debug（也可用环境变量 DFABRIC_LOG）
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+    /// 不写日志文件，只输出到终端
+    #[arg(long, global = true)]
+    no_log: bool,
+    /// 同时把日志镜像到 stderr（便于把终端输出和日志对照）
+    #[arg(long, global = true)]
+    log_stderr: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -60,14 +69,54 @@ enum Cmd {
     },
     /// 删除信任设备（同时提醒在手机上解除信任）
     Remove { node_id: String },
+    /// 自检：协议核心 + 本机环境 + 已配对设备（不修改任何数据）
+    Selftest {
+        /// 以 JSON 输出（便于附到问题报告）
+        #[arg(long)]
+        json: bool,
+        /// 跳过蓝牙检查（macOS 上不会触发蓝牙权限询问）
+        #[arg(long)]
+        no_ble: bool,
+        /// 跳过 mDNS 检查
+        #[arg(long)]
+        no_mdns: bool,
+        /// 额外对每个已配对设备做 TLS + HELLO + STATUS（需要手机在线）
+        #[arg(long)]
+        connect: bool,
+        /// 单台设备连通超时（秒）
+        #[arg(long, default_value_t = 6)]
+        timeout: u64,
+    },
+    /// 查看日志：默认打印最后若干行与日志目录
+    Logs {
+        /// 打印的行数
+        #[arg(long, default_value_t = 40)]
+        tail: usize,
+        /// 只打印日志文件路径
+        #[arg(long)]
+        path: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
+    let level = cli
+        .log_level
+        .as_deref()
+        .and_then(df_core::logging::Level::parse)
+        .or_else(dfabric::logging::level_from_env)
+        .unwrap_or(df_core::logging::Level::Info);
+    if cli.no_log {
+        df_core::logging::set_level(level);
+        df_core::logging::set_stderr(true);
+    } else {
+        dfabric::logging::init_or_stderr(Some(level), cli.log_stderr);
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let code = match rt.block_on(run(cli.cmd)) {
         Ok(()) => 0,
         Err(e) => {
+            df_core::logging::error("dfctl", format!("命令失败：{e}"));
             eprintln!("错误: {e}");
             1
         }
@@ -166,7 +215,58 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("已删除。请同时在手机上解除对这台电脑的信任。");
             Ok(())
         }
+        Cmd::Selftest { json, no_ble, no_mdns, connect, timeout } => {
+            selftest(json, no_ble, no_mdns, connect, timeout).await
+        }
+        Cmd::Logs { tail, path } => {
+            if path {
+                match df_core::logging::log_path() {
+                    Some(p) => println!("{}", p.display()),
+                    None => println!("（日志未初始化：日志目录 {}）", dfabric::logging::log_dir().display()),
+                }
+                return Ok(());
+            }
+            let lines = df_core::logging::recent(tail);
+            if lines.is_empty() {
+                println!("（暂无日志内容）");
+            } else {
+                for l in &lines {
+                    println!("{l}");
+                }
+            }
+            println!("\n日志目录: {}", dfabric::logging::log_dir().display());
+            println!("提示: `dfctl selftest` 会把自检结果写入同一份日志");
+            Ok(())
+        }
     }
+}
+
+/// 自检报告：文本或 JSON；有 FAIL 时以退出码 2 结束（0 = 全部通过，1 = 命令本身出错）。
+async fn selftest(json: bool, no_ble: bool, no_mdns: bool, connect: bool, timeout: u64) -> Result<()> {
+    let opts = selfcheck::Options {
+        ble: !no_ble,
+        mdns: !no_mdns,
+        connect,
+        timeout: Duration::from_secs(timeout.max(1)),
+    };
+    df_core::logging::info("selftest", format!("开始自检（{opts:?}）"));
+    let checks = selfcheck::run(&opts).await;
+    let (pass, warn, fail, skip) = selfcheck::summary(&checks);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        for c in &checks {
+            println!("[{:<4}] {}: {}", c.status.as_str(), c.name, c.detail);
+        }
+    }
+    let tail = format!("自检结果：PASS {pass} / WARN {warn} / FAIL {fail} / SKIP {skip}");
+    println!("{tail}");
+    df_core::logging::info("selftest", &tail);
+    if selfcheck::has_failure(&checks) {
+        // 直接以退出码 2 结束：所有输出与日志都已落盘（日志每次写入即落盘）
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn print_reply(reply: IpcReply) -> Result<()> {
@@ -213,7 +313,14 @@ async fn pair_near(scan: Duration) -> Result<()> {
         }
         let store = dfabric::open_store()?;
         let name = dfabric::display_name(&store);
-        let hs = df_core::pairing::near::near_prepare(&mut session, &name).await?;
+        // eid 必须取自刚才读到的 INFO：DF-NEAR-1 由本端先发 NEAR_COMMIT，
+        // 在这里等节点先说话会一直等到节点判空闲断开。
+        let hs = tokio::time::timeout(
+            Duration::from_secs(20),
+            df_core::pairing::near::near_prepare(&mut session, &eid, &name),
+        )
+        .await
+        .map_err(|_| DfError::Timeout("附近配对握手超时（请确认手机仍停在「添加设备」窗口）".into()))??;
         println!();
         println!("  ╔══════════════════════╗");
         println!("  ║  验证码: {}         ║", hs.sas());
@@ -231,9 +338,11 @@ async fn pair_near(scan: Duration) -> Result<()> {
         let trust = df_core::stores::Trust::from_pair_result(&pr);
         dfabric::secrets::protect_trust(&trust);
         store.upsert_trust(trust.clone())?;
-        println!("配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12]);
-        // 先持久保存信任，再尝试验证；链路失败不影响已保存的信任
-        let _ = ble_auth::hint_for(&[0u8; 32], &eid); // 保持 ble_auth 引用（模块化验证入口）
+        df_core::logging::info(
+            "pair",
+            format!("附近配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]),
+        );
+        println!("配对成功：{}（nodeId {}…）", trust.name.as_deref().unwrap_or("Lineage 设备"), &trust.node_id[..12.min(trust.node_id.len())]);
         return Ok(());
     }
     Err(DfError::Pairing("没有设备处于配对窗口".into()))

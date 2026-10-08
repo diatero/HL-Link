@@ -33,7 +33,11 @@ fs4 = "0.12"
 libc = "0.2"
 btleplug = "0.11"
 mdns-sd = "0.13"
-keyring = "3"
+# 必须显式启用各平台后端：keyring 3.x 的 default features 为空，未启用时
+# 会退化成「内存 mock」——读写都返回成功但不落盘，既存不住机密，也会让自检假阳性。
+# apple-native = macOS 钥匙串（security-framework），windows-native = 凭据管理器，
+# sync-secret-service = Linux Secret Service（dbus-secret-service）。
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]

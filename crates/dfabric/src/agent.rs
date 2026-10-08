@@ -175,8 +175,19 @@ impl Agent {
     pub async fn start() -> Result<std::sync::Arc<Agent>> {
         let store = open_store()?;
         crate::secrets::restore_secrets_into_trusts(&store);
+        df_core::logging::info(
+            "agent",
+            format!(
+                "Agent 启动：数据目录 {}，已配对 {} 台设备",
+                crate::data_dir().display(),
+                store.trusts().len()
+            ),
+        );
         let mdns = crate::mdns::MdnsBrowser::new();
-        let _ = mdns.start(); // mDNS 不可用时退回 BLE/上次地址，不致命
+        if let Err(e) = mdns.start() {
+            // mDNS 不可用时退回 BLE/上次地址，不致命
+            df_core::logging::warn("agent", format!("mDNS 启动失败：{e}"));
+        }
 
         let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
         let agent = std::sync::Arc::new(Agent { store, mdns, queue_tx });
@@ -257,7 +268,9 @@ async fn send_worker(agent: std::sync::Arc<Agent>, mut rx: tokio::sync::mpsc::Un
                 Err(e) => {
                     rec.state = "failed".into();
                     rec.error = Some(e.to_string());
+                    let label = rec.meta.name.clone();
                     update_send(rec).ok();
+                    df_core::logging::warn("send", format!("发送失败（{label}）：{e}"));
                     notify("发送失败", &e.to_string());
                 }
             }
@@ -276,11 +289,19 @@ async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
 
     if rec.state == "queued-text" {
         let text = rec.done_b64.clone();
+        df_core::logging::info("send", format!("发送文本（{} 字节）", text.len()));
         df_core::transfer::up::send_text(&mut ctrl, &rec.meta.transfer_id, &text).await?;
         rec.state = "completed".into();
         update_send(rec.clone()).ok();
         return Ok(());
     }
+    df_core::logging::info(
+        "send",
+        format!(
+            "开始发送 {}（{} 字节，transferId {}）",
+            rec.meta.name, rec.meta.size, rec.meta.transfer_id
+        ),
+    );
 
     let staged = agent.store.staging_dir().join(&rec.meta.transfer_id);
     let mut done = df_core::bitmap::decode_bits(&rec.done_b64, rec.meta.chunk_count()).unwrap_or_default();
@@ -308,6 +329,7 @@ async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
         rec.state = "completed".into();
         update_send(rec.clone()).ok();
         let _ = std::fs::remove_file(&staged);
+        df_core::logging::info("send", format!("发送完成：{}（{}）", rec.meta.name, rec.meta.transfer_id));
         notify("发送完成", &rec.meta.name);
     } else {
         rec.state = "completed".into();
@@ -318,10 +340,24 @@ async fn run_send_task(agent: &Agent, rec: &mut SendRecord) -> Result<()> {
 
 /// 接收轮询：每 3 秒 PULL_LIST（独立控制会话，不与发送共用）。
 async fn receive_poller(agent: std::sync::Arc<Agent>) {
+    df_core::logging::info("agent", "接收轮询已启动（每 3 秒 PULL_LIST；接受前不拉取任何字节）");
+    let mut last_err: Option<String> = None;
     loop {
         let trusts = agent.store.trusts();
+        let mut errored: Option<String> = None;
         for trust in trusts.iter().filter(|t| !t.revoked) {
-            let _ = poll_one(&agent, trust).await;
+            if let Err(e) = poll_one(&agent, trust).await {
+                errored = Some(e.to_string());
+            }
+        }
+        // 只在状态变化时记录，避免每 3 秒刷屏
+        if errored != last_err {
+            match &errored {
+                Some(msg) => df_core::logging::debug("recv", format!("接收轮询未能连接：{msg}")),
+                None if last_err.is_some() => df_core::logging::info("recv", "接收轮询已恢复连接"),
+                None => {}
+            }
+            last_err = errored;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -351,6 +387,16 @@ async fn poll_one(agent: &Agent, trust: &Trust) -> Result<()> {
             state: "pending".into(),
             done_b64: String::new(),
         };
+        df_core::logging::info(
+            "recv",
+            format!(
+                "收到发送请求：{}（{} 字节，transferId {}）来自 {}",
+                offer.meta.name,
+                offer.meta.size,
+                offer.meta.transfer_id,
+                trust.name.as_deref().unwrap_or("Lineage 设备")
+            ),
+        );
         update_pull(rec).ok();
         notify("收到文件请求", &format!("{} 想发送「{}」", trust.name.as_deref().unwrap_or("Lineage 设备"), offer.meta.name));
     }
@@ -375,10 +421,12 @@ pub async fn run_ipc_server(agent: std::sync::Arc<Agent>, mut shutdown: tokio::s
         let listener = match tokio::net::UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) => {
+                df_core::logging::error("ipc", format!("IPC 绑定失败 {}: {e}", path.display()));
                 eprintln!("IPC 绑定失败: {e}");
                 return;
             }
         };
+        df_core::logging::info("ipc", format!("IPC 已监听 {}", path.display()));
         // 只对当前用户开放（目录 0700 + socket 0600）
         #[cfg(unix)]
         {
@@ -534,6 +582,10 @@ pub async fn accept_pull(
     let mut rec_mut = rec.clone();
     rec_mut.state = "accepted".into();
     update_pull(rec_mut.clone()).ok();
+    df_core::logging::info(
+        "recv",
+        format!("开始接收 {}（{} 字节，transferId {}）", meta.name, meta.size, meta.transfer_id),
+    );
 
     let mut journal = |set: &BTreeSet<u64>| {
         rec_mut.done_b64 = df_core::bitmap::encode_bits(set);

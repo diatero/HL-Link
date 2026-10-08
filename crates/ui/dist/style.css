@@ -127,3 +127,15 @@ input[type="text"]:focus { border-color: var(--accent); }
   background: #1c2333; color: #fff; padding: 10px 20px; border-radius: 10px;
   font-size: 13px; z-index: 20; box-shadow: 0 4px 14px rgba(0,0,0,.25);
 }
+
+/* —— 诊断页 —— */
+h3 { font-size: 14px; font-weight: 600; margin: 20px 0 10px; }
+.panel > h3:first-child { margin-top: 0; }
+.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.logview {
+  background: #0f1524; color: #d7dce8; border-radius: var(--radius);
+  padding: 12px 14px; font-size: 12px; line-height: 1.55;
+  max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  user-select: text; margin-top: 6px;
+}

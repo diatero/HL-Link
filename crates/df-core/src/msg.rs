@@ -14,7 +14,9 @@ pub struct Envelope {
     pub v: u8,
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default)]
+    /// 线上字段名必须是驼峰 `requestId`：节点 `Wire.read()` 用 `o.getString("requestId")`
+    /// 强制取值，缺字段会整帧判 INVALID_FRAME（配对与所有控制操作都会失败）。
+    #[serde(default, rename = "requestId")]
     pub request_id: String,
     #[serde(default)]
     pub body: Value,

@@ -39,10 +39,14 @@ pub fn delete_secret(node_id: &str, key: &str) -> Result<()> {
 /// 保存信任时把机密同步进 keyring（尽力而为；失败不影响本地 0600 文件回退）。
 pub fn protect_trust(trust: &df_core::stores::Trust) {
     if !trust.key_pem.is_empty() {
-        let _ = store_secret(&trust.node_id, "keyPem", &trust.key_pem);
+        if let Err(e) = store_secret(&trust.node_id, "keyPem", &trust.key_pem) {
+            df_core::logging::warn("secrets", format!("私钥未写入平台安全存储（保留 0600 文件回退）：{e}"));
+        }
     }
     if let Some(b64) = &trust.ble_key_b64 {
-        let _ = store_secret(&trust.node_id, "bleKey", b64);
+        if let Err(e) = store_secret(&trust.node_id, "bleKey", b64) {
+            df_core::logging::warn("secrets", format!("bleKey 未写入平台安全存储（保留 0600 文件回退）：{e}"));
+        }
     }
 }
 

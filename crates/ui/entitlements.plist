@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened Runtime / 沙箱签名时使用的 entitlements。
+
+  DeviceFabric 桌面端只做 Controller：全部连接由本机发起，不监听入站端口，
+  所以**不需要** com.apple.security.network.server。
+  蓝牙必须显式声明，否则签名后的应用在 CoreBluetooth 上会被拒绝。
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.bluetooth</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+</dict>
+</plist>
