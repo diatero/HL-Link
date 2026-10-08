@@ -1,3 +1,8 @@
+if (!window.__TAURI__) {
+  document.body.innerHTML =
+    '<div style="padding:40px;color:#e03131;font-size:15px">Tauri API 未注入：请确认 tauri.conf.json 已开启 withGlobalTauri 并重新构建。</div>';
+  throw new Error("__TAURI__ is not available");
+}
 const { invoke } = window.__TAURI__.core;
 const { open } = window.__TAURI__.dialog;
 const { listen } = window.__TAURI__.event;
