@@ -211,6 +211,7 @@ impl Node {
         inner.tickets.lock().unwrap().clear();
         inner.pull_tickets.lock().unwrap().clear();
         inner.sessions.lock().unwrap().clear();
+        inner.seen.lock().unwrap().clear();
         df_core::logging::info("node", "节点已关闭");
     }
 
