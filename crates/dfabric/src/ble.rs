@@ -38,8 +38,14 @@ pub async fn device_label(peripheral: &Peripheral) -> String {
 }
 
 /// 取第一个可用适配器（macOS 走 CoreBluetooth，Linux 走 BlueZ）。
+///
+/// 整个进程只建一个 Manager：在 Linux 上每个 `Manager::new()` 都会打开一条新的系统 D-Bus 连接且不会随
+/// 句柄释放而关闭。dfabricd 每次 BLE 回退都新建一个，曾累积到 D-Bus 每用户连接上限（影响本用户的其他程序）。
 async fn first_adapter() -> Result<Adapter> {
-    let manager = Manager::new().await.map_err(|e| DfError::Ble(format!("BLE 管理器: {e}")))?;
+    static MANAGER: tokio::sync::OnceCell<Manager> = tokio::sync::OnceCell::const_new();
+    let manager = MANAGER
+        .get_or_try_init(|| async { Manager::new().await.map_err(|e| DfError::Ble(format!("BLE 管理器: {e}"))) })
+        .await?;
     let adapters = manager.adapters().await.map_err(|e| DfError::Ble(format!("获取适配器: {e}")))?;
     adapters
         .into_iter()
